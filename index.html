@@ -47,13 +47,14 @@
             <h2>Escanear LPN</h2>
             <span id="estadoCarga">Esperando data...</span>
           </div>
-          <button type="button" id="refreshButton">Actualizar</button>
+          <button type="button" id="refreshButton">Actualizar data</button>
         </div>
 
         <form class="scan-form" id="scanForm">
-          <input id="lpnInput" placeholder="LPN" autocomplete="off" autocapitalize="characters" spellcheck="false">
+          <input id="lpnInput" placeholder="LPN, codigo o estilo" autocomplete="off" autocapitalize="characters" spellcheck="false">
           <button type="submit">Buscar</button>
         </form>
+        <div id="sugerenciasBusqueda" class="suggestions-box" hidden></div>
 
         <div class="scan-actions">
           <button type="button" id="cameraButton">Camara</button>
