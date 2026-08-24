@@ -1,6 +1,7 @@
 const SHEET_ID = "1-v6vXjHpLlIn0-_lVZw0BtGopnxSHH0zqoOrW8aBwcg";
 
 let dataLPN = [];
+let dataPedido = [];
 let dataProductos = [];
 let dataInventario = [];
 let dataUbicaciones = [];
@@ -142,18 +143,20 @@ function productoPorCodigo(codigo) {
 async function cargarDatos() {
   datosListos = false;
   estado("Cargando data RF...");
-  const [lpns, productos, inventario, ubicaciones, bloqueo] = await Promise.all([
+  const [lpns, pedido, productos, inventario, ubicaciones, bloqueo] = await Promise.all([
     cargarHoja("LPNS"),
+    cargarOpcional("PEDIDO"),
     cargarOpcional("PRODUCTOS"),
     cargarOpcional("INV_ACTIVO"),
     cargarOpcional("UBICACION"),
     cargarOpcional("BLOQUEO")
   ]);
   dataProductos = productos.map(normalizarFilaProducto).filter(row => row.codigo);
+  dataPedido = pedido;
   dataLPN = lpns.map(normalizarFilaLpn).filter(row => row.lpn);
   dataInventario = inventario.map(normalizarFilaInventario).filter(row => row.codigo);
   dataUbicaciones = ubicaciones;
   dataBloqueo = bloqueo;
   datosListos = true;
-  estado(`${fmt(dataLPN.length)} LPNs | ${fmt(dataInventario.length)} activos`);
+  estado(`${fmt(dataLPN.length)} LPNs | ${fmt(dataPedido.length)} pedidos | ${fmt(dataInventario.length)} activos`);
 }

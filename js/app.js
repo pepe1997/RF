@@ -9,6 +9,8 @@ let lpnActualRows = [];
 let productosActuales = [];
 let codigoSeleccionado = "";
 let timerSugerencias = null;
+let vistaRf = "consulta";
+let cacheValidacionPlus = null;
 
 function estado(texto) {
   const el = document.getElementById("estadoCarga");
@@ -59,7 +61,8 @@ function salir() {
 async function recargarDatos(forzar = true) {
   if (datosListos && !forzar) {
     estado(`${fmt(dataLPN.length)} LPNs | data lista`);
-    enfocarLpn();
+    if (vistaRf === "validacion") renderValidacionPlusMovil();
+    else enfocarLpn();
     return;
   }
   const boton = document.getElementById("refreshButton");
@@ -69,7 +72,9 @@ async function recargarDatos(forzar = true) {
   }
   try {
     await cargarDatos();
-    enfocarLpn();
+    cacheValidacionPlus = null;
+    if (vistaRf === "validacion") renderValidacionPlusMovil();
+    else enfocarLpn();
   } catch (error) {
     estado("Error al cargar data");
     mostrarMensaje("No se pudo cargar LPNS", error.message || String(error), true);
@@ -518,6 +523,419 @@ function lpnsProducto(producto) {
   return Array.from(mapa.values()).sort((a, b) => ordenarUbicacion(a.ubicacion, b.ubicacion) || b.bultos - a.bultos);
 }
 
+function campoPedido(row, nombres) {
+  for (const nombre of nombres) {
+    if (row[nombre] !== undefined && row[nombre] !== null && row[nombre] !== "") return row[nombre];
+  }
+  const keys = Object.keys(row || {});
+  for (const nombre of nombres) {
+    const found = keys.find(k => normalizar(k) === normalizar(nombre));
+    if (found && row[found] !== undefined && row[found] !== null && row[found] !== "") return row[found];
+  }
+  return "";
+}
+
+function codigoPedido(row) {
+  return normalizar(campoPedido(row, ["PRODUCTO", "Producto", "CODIGO", "Codigo"]));
+}
+
+function codigoAltPedido(row) {
+  return limpiar(campoPedido(row, [
+    "CODIGO_ALT",
+    "COD_ALT",
+    "CODIGO ALTERNATIVO",
+    "Codigo Alternativo",
+    "Cod Alternat",
+    "Codigo alternativo"
+  ]));
+}
+
+function descripcionPedido(row) {
+  return limpiar(campoPedido(row, ["DESCRIPCION", "Descripcion", "Descripción", "DESCRIPCION_PRODUCTO"]));
+}
+
+function bultosNoAsignadoPedido(row) {
+  return num(campoPedido(row, ["BULTOS_NO_ASIGNADO", "BULTO_NO_ASIGANDO", "BULTOS_NO_ASIGANDO"]));
+}
+
+function obtenerPedidoNoAsignadoRf() {
+  const mapa = new Map();
+  (dataPedido || []).forEach(row => {
+    const codigo = codigoPedido(row);
+    const bultos = bultosNoAsignadoPedido(row);
+    if (!codigo || bultos <= 0) return;
+    if (!mapa.has(codigo)) {
+      const producto = productoPorCodigo(codigo);
+      mapa.set(codigo, {
+        codigo,
+        codigoAlt: codigoAltPedido(row) || producto?.codigoAlt || "",
+        estilo: producto?.estilo || "",
+        descripcion: descripcionPedido(row) || producto?.descripcion || "",
+        total: 0
+      });
+    }
+    const item = mapa.get(codigo);
+    item.total += bultos;
+    if (!item.codigoAlt) item.codigoAlt = codigoAltPedido(row);
+    if (!item.descripcion) item.descripcion = descripcionPedido(row);
+  });
+  return Array.from(mapa.values());
+}
+
+function ubicacionTipoValidacion(ubicacion) {
+  const u = normalizar(ubicacion);
+  if (u.startsWith("MASS-")) return "reserva";
+  if (!u || u.startsWith("DROP-BUFR") || u.startsWith("RAMPA-") || u.startsWith("DROP-STOCK-DESBLOQ-962")) return "otras";
+  return "ignorar";
+}
+
+function pasilloReservaRf(ubicacion) {
+  const p = limpiar(ubicacion).toUpperCase().split("-");
+  if (p[0] !== "MASS" || !p[1]) return "";
+  return String(Number(p[1]) || p[1]).padStart(2, "0");
+}
+
+function lpnsStockProducto(codigo) {
+  return dataLPN.filter(row =>
+    normalizar(row.codigo) === codigo &&
+    (normalizar(row.estado) === "UBICADO" || normalizar(row.estado) === "RECIBIDO")
+  );
+}
+
+function elegirStockRf(rows, requerido) {
+  const utiles = rows
+    .map(row => ({ row, stock: num(row.bultos) }))
+    .filter(x => x.stock > 0)
+    .sort((a, b) => a.stock - b.stock);
+  let restante = requerido;
+  const usados = [];
+  for (const item of utiles) {
+    if (restante <= 0) break;
+    const tomar = Math.min(restante, item.stock);
+    usados.push({ ...item, tomar });
+    restante -= tomar;
+  }
+  return usados;
+}
+
+function activosValidacionProducto(item, requerido) {
+  const producto = productoPorCodigo(item.codigo) || {};
+  const uxb = producto.uxb || 1;
+  const agrupados = new Map();
+  dataInventario
+    .filter(row => row.codigo === item.codigo || normalizar(row.codigoAlt) === normalizar(item.codigoAlt))
+    .filter(row => row.ubicacion)
+    .forEach(row => {
+      const key = row.ubicacion;
+      if (!agrupados.has(key)) {
+        agrupados.set(key, {
+          row,
+          stock: 0
+        });
+      }
+      const disponibleUnd = Math.max(0, num(row.unact) - num(row.uniAsig));
+      const rowUxb = row.uxb || uxb || 1;
+      agrupados.get(key).stock += rowUxb ? disponibleUnd / rowUxb : disponibleUnd;
+    });
+  return elegirStockRf(Array.from(agrupados.values()).map(x => ({
+    ...x.row,
+    bultos: x.stock,
+    lpn: `ACTIVO ${x.row.ubicacion}`
+  })), requerido);
+}
+
+function agruparCodPlusRf() {
+  const porLpn = new Map();
+  dataLPN
+    .filter(row => normalizar(row.ubicacion) === "DROP-COD-PLUS-ALM")
+    .filter(row => ["UBICADO", "ASIGNACION PARCIAL", "ASIGNACIÓN PARCIAL"].includes(normalizar(row.estado)))
+    .forEach(row => {
+      const codigo = normalizar(row.codigo);
+      const lpn = limpiar(row.lpn);
+      if (!codigo || !lpn) return;
+      const key = `${codigo}|${lpn}`;
+      if (!porLpn.has(key)) {
+        porLpn.set(key, {
+          codigo,
+          lpn,
+          ubicacion: row.ubicacion,
+          estado: row.estado,
+          bultos: 0,
+          unidades: 0
+        });
+      }
+      const item = porLpn.get(key);
+      item.bultos += num(row.bultos);
+      item.unidades += num(row.unidades || row.bultos);
+    });
+
+  const porProducto = new Map();
+  porLpn.forEach(row => {
+    if (!porProducto.has(row.codigo)) porProducto.set(row.codigo, { bultos: 0, lpns: [] });
+    const item = porProducto.get(row.codigo);
+    item.bultos += row.bultos;
+    item.lpns.push(row);
+  });
+  return porProducto;
+}
+
+function estadoValidacionPlusRf(pedido, codPlus, pedidoOriginal, activo) {
+  const difFila = codPlus - pedido;
+  const sobranteReal = Math.max(0, codPlus - pedidoOriginal);
+  if (codPlus <= 0) return { texto: "Sin avance", clase: "bad", difFila, sobranteReal };
+  if (Math.abs(difFila) < 0.0001) return { texto: "Completo", clase: "ok", difFila, sobranteReal };
+  if (difFila < 0) return { texto: "Falta", clase: "warn", difFila, sobranteReal };
+  if (sobranteReal <= 0.0001 && activo > 0) return { texto: "Conciliable", clase: "warn", difFila, sobranteReal };
+  return { texto: "Sobrante real", clase: "bad", difFila, sobranteReal };
+}
+
+function obtenerValidacionPlusRf() {
+  if (cacheValidacionPlus) return cacheValidacionPlus;
+  const pedido = obtenerPedidoNoAsignadoRf();
+  const codPlus = agruparCodPlusRf();
+  const codPlusRestante = new Map();
+  codPlus.forEach((value, codigo) => codPlusRestante.set(codigo, value.bultos));
+  const filas = [];
+
+  pedido.forEach(item => {
+    const stock = lpnsStockProducto(item.codigo);
+    const reserva = stock.filter(row => ubicacionTipoValidacion(row.ubicacion) === "reserva");
+    const otras = stock.filter(row => ubicacionTipoValidacion(row.ubicacion) === "otras");
+    let restante = item.total;
+    let asignadoActivo = 0;
+
+    activosValidacionProducto(item, restante).forEach(usado => {
+      const tomar = Math.min(restante, usado.tomar);
+      asignadoActivo += tomar;
+      restante -= tomar;
+    });
+
+    elegirStockRf(reserva, restante).forEach(usado => {
+      const tomar = Math.min(restante, usado.tomar);
+      if (tomar <= 0) return;
+      filas.push({
+        origen: "RESERVA",
+        grupo: pasilloReservaRf(usado.row.ubicacion) || "SIN",
+        codigo: item.codigo,
+        codigoAlt: item.codigoAlt,
+        descripcion: item.descripcion,
+        pedidoOriginal: item.total,
+        activo: asignadoActivo,
+        pedido: tomar,
+        lpnOrigen: usado.row.lpn,
+        ubicacionOrigen: usado.row.ubicacion
+      });
+      restante -= tomar;
+    });
+
+    elegirStockRf(otras, restante).forEach(usado => {
+      const tomar = Math.min(restante, usado.tomar);
+      if (tomar <= 0) return;
+      filas.push({
+        origen: "OTRAS",
+        grupo: "OTRAS",
+        codigo: item.codigo,
+        codigoAlt: item.codigoAlt,
+        descripcion: item.descripcion,
+        pedidoOriginal: item.total,
+        activo: asignadoActivo,
+        pedido: tomar,
+        lpnOrigen: usado.row.lpn,
+        ubicacionOrigen: usado.row.ubicacion || "SIN UBICACION"
+      });
+      restante -= tomar;
+    });
+
+    if (restante > 0) {
+      filas.push({
+        origen: "SIN_STOCK",
+        grupo: "SIN_STOCK",
+        codigo: item.codigo,
+        codigoAlt: item.codigoAlt,
+        descripcion: item.descripcion,
+        pedidoOriginal: item.total,
+        activo: asignadoActivo,
+        pedido: restante,
+        lpnOrigen: "",
+        ubicacionOrigen: "SIN STOCK"
+      });
+    }
+  });
+
+  filas.forEach(row => {
+    const plus = codPlus.get(row.codigo) || { bultos: 0, lpns: [] };
+    const disponible = codPlusRestante.get(row.codigo) || 0;
+    const asignado = Math.min(row.pedido, disponible);
+    codPlusRestante.set(row.codigo, Math.max(0, disponible - asignado));
+    row.codPlus = asignado;
+    row.lpnsCodPlus = plus.lpns;
+    Object.assign(row, estadoValidacionPlusRf(row.pedido, row.codPlus, row.pedidoOriginal, row.activo));
+  });
+
+  codPlusRestante.forEach((sobrante, codigo) => {
+    if (sobrante <= 0) return;
+    const candidatas = filas.filter(row => row.codigo === codigo);
+    if (!candidatas.length) return;
+    const row = candidatas[candidatas.length - 1];
+    row.codPlus += sobrante;
+    Object.assign(row, estadoValidacionPlusRf(row.pedido, row.codPlus, row.pedidoOriginal, row.activo));
+  });
+
+  cacheValidacionPlus = filas.sort((a, b) =>
+    (a.origen === "RESERVA" ? 1 : a.origen === "OTRAS" ? 2 : 3) - (b.origen === "RESERVA" ? 1 : b.origen === "OTRAS" ? 2 : 3) ||
+    String(a.grupo).localeCompare(String(b.grupo), "es", { numeric: true }) ||
+    b.pedido - a.pedido
+  );
+  return cacheValidacionPlus;
+}
+
+function resumenGrupoValidacionRf(data) {
+  return data.reduce((acc, row) => {
+    acc.filas += 1;
+    acc.pedido += row.pedido;
+    acc.plus += row.codPlus;
+    acc.faltan += Math.max(0, row.pedido - row.codPlus);
+    acc.sobrante += Math.max(0, row.sobranteReal);
+    return acc;
+  }, { filas: 0, pedido: 0, plus: 0, faltan: 0, sobrante: 0 });
+}
+
+function tarjetaValidacionRf(row, index) {
+  return `
+    <button type="button" class="validation-item ${row.clase}" data-index="${index}">
+      <span class="product-main">
+        <b>${htmlSeguro(row.codigo)}${row.codigoAlt ? ` | ${htmlSeguro(row.codigoAlt)}` : ""}</b>
+        <small>${htmlSeguro(row.descripcion || "Sin descripcion")}</small>
+      </span>
+      <span class="validation-numbers">
+        <b>${fmt(row.pedido)}</b>
+        <small>Pedido</small>
+      </span>
+      <span class="validation-badge ${row.clase}">${htmlSeguro(row.texto)}</span>
+      <span class="validation-meta">${htmlSeguro(row.ubicacionOrigen || "-")} | Plus ${fmt(row.codPlus)} | Dif ${fmt(row.difFila)}</span>
+    </button>
+  `;
+}
+
+function bloqueValidacionRf(titulo, data, abierto = false) {
+  if (!data.length) return "";
+  const resumen = resumenGrupoValidacionRf(data);
+  return `
+    <details class="validation-block" ${abierto ? "open" : ""}>
+      <summary>
+        <span>
+          <b>${htmlSeguro(titulo)}</b>
+          <small>${fmt(resumen.filas)} filas | ${fmt(resumen.pedido)} pedido | ${fmt(resumen.plus)} Plus</small>
+        </span>
+        <strong>${fmt(resumen.faltan)}</strong>
+      </summary>
+      <div class="validation-list">
+        ${data.map(row => tarjetaValidacionRf(row, row._index)).join("")}
+      </div>
+    </details>
+  `;
+}
+
+function renderValidacionPlusMovil() {
+  if (!datosListos) {
+    mostrarMensaje("Data cargando", "Espera unos segundos y vuelve a abrir la validacion.");
+    return;
+  }
+  const data = obtenerValidacionPlusRf().map((row, index) => ({ ...row, _index: index }));
+  const resumen = resumenGrupoValidacionRf(data);
+  const reserva = data.filter(row => row.origen === "RESERVA");
+  const bloquesReserva = Array.from({ length: 12 }, (_, i) => {
+    const pasillo = String(i + 1).padStart(2, "0");
+    return bloqueValidacionRf(`Reserva pasillo ${pasillo}`, reserva.filter(row => row.grupo === pasillo), i === 0);
+  }).join("");
+  const sinPasillo = bloqueValidacionRf("Reserva sin pasillo", reserva.filter(row => !/^\d{2}$/.test(row.grupo)));
+  const otras = bloqueValidacionRf("Otras ubicaciones", data.filter(row => row.origen === "OTRAS"), false);
+  const sinStock = bloqueValidacionRf("Sin stock", data.filter(row => row.origen === "SIN_STOCK"), false);
+
+  document.getElementById("resultado").innerHTML = `
+    <article class="result-card validation-screen">
+      <div class="result-head">
+        <span>Validacion Plus</span>
+        <strong>No asignado</strong>
+      </div>
+      <div class="kpi-grid">
+        <div class="mini-kpi"><span>Filas</span><strong>${fmt(resumen.filas)}</strong></div>
+        <div class="mini-kpi"><span>Pedido</span><strong>${fmt(resumen.pedido)}</strong></div>
+        <div class="mini-kpi ok"><span>Plus</span><strong>${fmt(resumen.plus)}</strong></div>
+        <div class="mini-kpi bad"><span>Faltan</span><strong>${fmt(resumen.faltan)}</strong></div>
+      </div>
+      <div class="validation-groups">
+        ${bloquesReserva}${sinPasillo}${otras}${sinStock || `<div class="empty-mini">Sin productos sin stock.</div>`}
+      </div>
+    </article>
+  `;
+}
+
+function verDetalleValidacionRf(index) {
+  const row = obtenerValidacionPlusRf()[Number(index)];
+  if (!row) return;
+  document.getElementById("resultado").innerHTML = `
+    <article class="result-card validation-screen">
+      <div class="result-head">
+        <span>${htmlSeguro(row.origen)} | ${htmlSeguro(row.ubicacionOrigen || "-")}</span>
+        <strong>${htmlSeguro(row.codigo)}</strong>
+      </div>
+      <div class="product-list">
+        <button type="button" class="back-button" id="volverValidacion">Volver</button>
+        <section class="selected-product">
+          <div class="decision-pill ${row.clase}">
+            <strong>${htmlSeguro(row.texto)}</strong>
+            <span>Plus primero: ${fmt(row.codPlus)} | Pedido fila: ${fmt(row.pedido)} | Sobrante real: ${fmt(row.sobranteReal)}</span>
+          </div>
+          <div class="selected-title">
+            <h3>${htmlSeguro(row.codigo)}${row.codigoAlt ? ` | ${htmlSeguro(row.codigoAlt)}` : ""}</h3>
+            <p>${htmlSeguro(row.descripcion || "Sin descripcion")}</p>
+          </div>
+          <div class="product-metrics">
+            <b>${fmt(row.pedidoOriginal)}<small>Pedido original</small></b>
+            <b>${fmt(row.activo)}<small>Activo</small></b>
+            <b>${fmt(row.pedido)}<small>Fila</small></b>
+          </div>
+          <div class="product-metrics">
+            <b>${fmt(row.codPlus)}<small>Plus</small></b>
+            <b>${fmt(row.difFila)}<small>Diferencia fila</small></b>
+            <b>${fmt(row.sobranteReal)}<small>Sobrante real</small></b>
+          </div>
+          <div class="dest-grid full">
+            <section>
+              <h4>LPNs en Plus</h4>
+              ${row.lpnsCodPlus.length ? row.lpnsCodPlus.map(lpn => `
+                <div class="dest-row ok">
+                  <div>
+                    <strong>${htmlSeguro(lpn.lpn)}</strong>
+                    <span>${htmlSeguro(lpn.ubicacion)} | ${htmlSeguro(lpn.estado)}</span>
+                  </div>
+                  <b>${fmt(lpn.bultos)}</b>
+                  <small>bultos</small>
+                </div>
+              `).join("") : `<div class="empty-mini bad">Sin LPNs en DROP-COD-PLUS-ALM.</div>`}
+            </section>
+          </div>
+        </section>
+      </div>
+    </article>
+  `;
+}
+
+function cambiarVistaRf(vista) {
+  vistaRf = vista;
+  document.getElementById("tabConsulta").classList.toggle("active", vista === "consulta");
+  document.getElementById("tabValidacion").classList.toggle("active", vista === "validacion");
+  document.querySelector(".scan-panel").hidden = vista !== "consulta";
+  if (vista === "validacion") {
+    detenerCamara();
+    renderValidacionPlusMovil();
+  } else {
+    mostrarMensaje("Listo para consulta", "Escanea un codigo de barras de LPN.");
+    enfocarLpn();
+  }
+}
+
 function renderActivoConsulta(activos) {
   if (!activos.length) return `<div class="empty-mini bad">Sin ubicacion activa para este codigo.</div>`;
   return activos.map(row => `
@@ -691,6 +1109,15 @@ function atributoSeguro(valor) {
 }
 
 function manejarClickResultado(event) {
+  const validacion = event.target.closest(".validation-item");
+  if (validacion) {
+    verDetalleValidacionRf(validacion.dataset.index);
+    return;
+  }
+  if (event.target.closest("#volverValidacion")) {
+    renderValidacionPlusMovil();
+    return;
+  }
   const boton = event.target.closest(".product-item");
   if (!boton) return;
   const codigo = boton.dataset.codigo || "";
@@ -830,6 +1257,8 @@ document.getElementById("refreshButton").addEventListener("click", () => recarga
 document.getElementById("logoutButton").addEventListener("click", salir);
 document.getElementById("cameraButton").addEventListener("click", alternarCamara);
 document.getElementById("resultado").addEventListener("click", manejarClickResultado);
+document.getElementById("tabConsulta").addEventListener("click", () => cambiarVistaRf("consulta"));
+document.getElementById("tabValidacion").addEventListener("click", () => cambiarVistaRf("validacion"));
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) detenerCamara();
 });

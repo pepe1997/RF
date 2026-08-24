@@ -171,6 +171,28 @@ button { cursor: pointer; }
   padding: 10px;
 }
 
+.rf-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.rf-tabs button {
+  min-height: 46px;
+  border: 2px solid var(--line);
+  border-radius: 12px;
+  color: var(--ink);
+  background: var(--white);
+  font-size: 14px;
+  font-weight: 950;
+}
+
+.rf-tabs button.active {
+  border-color: var(--blue);
+  color: white;
+  background: var(--blue);
+}
+
 .scan-panel,
 .result-card,
 .empty-state {
@@ -731,6 +753,152 @@ button { cursor: pointer; }
 .empty-mini.bad {
   border-left-color: var(--red);
   background: #fff1f0;
+}
+
+.validation-screen .result-head strong {
+  font-size: clamp(28px, 9vw, 42px);
+}
+
+.validation-groups {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+}
+
+.validation-block {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 13px;
+  background: white;
+}
+
+.validation-block summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 11px;
+  list-style: none;
+  cursor: pointer;
+}
+
+.validation-block summary::-webkit-details-marker {
+  display: none;
+}
+
+.validation-block summary span,
+.validation-block summary b,
+.validation-block summary small {
+  min-width: 0;
+  display: block;
+}
+
+.validation-block summary b {
+  color: #2c128f;
+  font-size: 15px;
+  font-weight: 950;
+  text-transform: uppercase;
+}
+
+.validation-block summary small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 850;
+}
+
+.validation-block summary strong {
+  min-width: 54px;
+  padding: 7px 9px;
+  border-radius: 10px;
+  color: white;
+  background: var(--red);
+  font-size: 19px;
+  text-align: center;
+}
+
+.validation-list {
+  display: grid;
+  gap: 7px;
+  padding: 0 9px 9px;
+}
+
+.validation-item {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 5px 8px;
+  align-items: center;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-left: 5px solid var(--blue);
+  border-radius: 11px;
+  color: var(--ink);
+  background: #fbfdff;
+  text-align: left;
+}
+
+.validation-item.ok {
+  border-left-color: var(--green);
+  background: #f0f8f2;
+}
+
+.validation-item.warn {
+  border-left-color: var(--gold);
+  background: #fff8eb;
+}
+
+.validation-item.bad {
+  border-left-color: var(--red);
+  background: #fff1f0;
+}
+
+.validation-numbers {
+  display: grid;
+  justify-items: end;
+}
+
+.validation-numbers b {
+  font-size: 20px;
+  font-weight: 950;
+}
+
+.validation-numbers small,
+.validation-meta {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.validation-badge {
+  justify-self: start;
+  padding: 5px 8px;
+  border-radius: 999px;
+  color: white;
+  background: var(--blue);
+  font-size: 10px;
+  font-weight: 950;
+  text-transform: uppercase;
+}
+
+.validation-badge.ok { background: var(--green); }
+.validation-badge.warn { background: var(--gold); }
+.validation-badge.bad { background: var(--red); }
+
+.validation-meta {
+  grid-column: 1 / -1;
+  text-transform: none;
+  line-height: 1.25;
+}
+
+.back-button {
+  min-height: 44px;
+  border: 0;
+  border-radius: 11px;
+  color: white;
+  background: var(--blue);
+  font-weight: 950;
 }
 
 @media (min-width: 560px) {
