@@ -1,4 +1,6 @@
 const SHEET_ID = "1-v6vXjHpLlIn0-_lVZw0BtGopnxSHH0zqoOrW8aBwcg";
+const BI_SHEET_ID = "1fMEnjNjCZf0c-9VPmeHOQnFERXy5jz7XJ2lY64tblRc";
+const RECEPCION_PROVEEDORES_SHEET_ID = "18iiFahjssG-2Or8HE9KjBer3DcuG0mDaMpxZj-rqycI";
 
 let dataLPN = [];
 let dataPedido = [];
@@ -6,6 +8,9 @@ let dataProductos = [];
 let dataInventario = [];
 let dataUbicaciones = [];
 let dataBloqueo = [];
+let dataPickingReporte = [];
+let dataRecepcionReporte = [];
+let dataRecepcionProveedoresResumen = [];
 let datosListos = false;
 
 function limpiar(valor) {
@@ -52,9 +57,25 @@ async function cargarHoja(nombre) {
   return await res.json();
 }
 
+async function cargarHojaDesde(sheetId, nombre) {
+  const url = `https://opensheet.elk.sh/${sheetId}/${encodeURIComponent(nombre)}`;
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText || ""}`.trim());
+  return await res.json();
+}
+
 async function cargarOpcional(nombre) {
   try {
     return await cargarHoja(nombre);
+  } catch (error) {
+    console.warn(`No se pudo cargar ${nombre}:`, error.message || error);
+    return [];
+  }
+}
+
+async function cargarOpcionalDesde(sheetId, nombre) {
+  try {
+    return await cargarHojaDesde(sheetId, nombre);
   } catch (error) {
     console.warn(`No se pudo cargar ${nombre}:`, error.message || error);
     return [];
@@ -157,6 +178,14 @@ async function cargarDatos() {
   dataInventario = inventario.map(normalizarFilaInventario).filter(row => row.codigo);
   dataUbicaciones = ubicaciones;
   dataBloqueo = bloqueo;
+  const [pickingReporte, recepcionReporte, proveedoresResumen] = await Promise.all([
+    cargarOpcionalDesde(BI_SHEET_ID, "PICKING"),
+    cargarOpcionalDesde(BI_SHEET_ID, "RECEPCION"),
+    cargarOpcionalDesde(RECEPCION_PROVEEDORES_SHEET_ID, "RESUMEN")
+  ]);
+  dataPickingReporte = pickingReporte;
+  dataRecepcionReporte = recepcionReporte;
+  dataRecepcionProveedoresResumen = proveedoresResumen;
   datosListos = true;
-  estado(`${fmt(dataLPN.length)} LPNs | ${fmt(dataPedido.length)} pedidos | ${fmt(dataInventario.length)} activos`);
+  estado(`${fmt(dataLPN.length)} LPNs | PICK ${fmt(dataPickingReporte.length)} | REC ${fmt(dataRecepcionReporte.length)}`);
 }

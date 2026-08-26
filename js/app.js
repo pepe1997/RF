@@ -11,6 +11,9 @@ let codigoSeleccionado = "";
 let timerSugerencias = null;
 let vistaRf = "consulta";
 let cacheValidacionPlus = null;
+let reporteActivo = "picking";
+let turnoReportePicking = "TODOS";
+let proveedoresReporteSeleccionados = null;
 
 function estado(texto) {
   const el = document.getElementById("estadoCarga");
@@ -25,6 +28,359 @@ function htmlSeguro(valor) {
     '"': "&quot;",
     "'": "&#039;"
   }[char]));
+}
+
+function corto(valor, max = 18) {
+  const texto = limpiar(valor);
+  return texto.length > max ? `${texto.slice(0, max)}...` : texto;
+}
+
+function pct(valor, total) {
+  return total > 0 ? (valor / total) * 100 : 0;
+}
+
+function pctCumplimiento(valor, total) {
+  return Math.min(100, pct(valor, total));
+}
+
+function fechaValor(valor) {
+  const texto = limpiar(valor);
+  if (!texto) return null;
+  const iso = texto.replace(" ", "T");
+  const fecha = new Date(iso);
+  if (!Number.isNaN(fecha.getTime())) return fecha;
+  const partes = texto.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+(\d{1,2}):(\d{2}))?/);
+  if (!partes) return null;
+  return new Date(Number(partes[3]), Number(partes[2]) - 1, Number(partes[1]), Number(partes[4] || 0), Number(partes[5] || 0));
+}
+
+function horaFecha(fecha) {
+  return fecha ? fecha.getHours() : null;
+}
+
+function turnoPorHora(hora) {
+  if (hora === null || hora === undefined) return "SIN TURNO";
+  if (hora >= 7 && hora < 16) return "DIA";
+  if (hora >= 16 && hora < 21) return "TARDE";
+  return "NOCHE";
+}
+
+function descripcionNoCuentaReporte(descripcion) {
+  const texto = normalizar(descripcion).replace(/[^A-Z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  const frescos = [
+    "FRUTA", "FRUTAS", "PLATANO", "BANANO", "BANANA", "PERA", "PERAS", "MANZANA", "MANZANAS",
+    "NARANJA", "NARANJAS", "MANDARINA", "MANDARINAS", "LIMON", "LIMONES", "FRESA", "FRESAS",
+    "UVA", "UVAS", "MANGO", "MANGOS", "PINA", "PINIA", "PALTA", "PALTAS", "SANDIA",
+    "MELON", "PAPAYA", "DURAZNO", "GRANADILLA", "MARACUYA", "KIWI", "CIRUELA", "CHIRIMOYA",
+    "VERDURA", "VERDURAS", "HORTALIZA", "HORTALIZAS", "ZANAHORIA", "ZANAHORIAS", "TOMATE",
+    "TOMATES", "CEBOLLA", "CEBOLLAS", "PAPA", "PAPAS", "CAMOTE", "CAMOTES", "YUCA",
+    "LECHUGA", "LECHUGAS", "BROCOLI", "PEPINO", "PEPINOS", "APIO", "BETERRAGA", "ESPINACA",
+    "ROCOTO", "AJI", "AJIES", "CHOCLO", "CHOCLOS", "PIMIENTO", "PIMIENTOS"
+  ].map(normalizar);
+  if (texto === "JABA" || texto === "JABAS" || texto.startsWith("JABA ") || texto.startsWith("JABAS ")) return true;
+  return frescos.some(item => texto === item || texto.startsWith(`${item} `));
+}
+
+function reportePickingValido(row) {
+  const tipo = normalizar(row.tipo).replace(/[^A-Z0-9]/g, "");
+  if (tipo === "FULLCONTAINER") return false;
+  if (normalizar(row.lpn).startsWith("ILE")) return false;
+  if (descripcionNoCuentaReporte(row.descripcion)) return false;
+  return true;
+}
+
+function modeloPickingReporte() {
+  return (dataPickingReporte || []).map((r, index) => {
+    const fecha = fechaValor(campo(r, ["FECHA PICK", "FECHA_PICK", "Fecha Pick", "FECHA"]));
+    const hora = horaFecha(fecha);
+    return {
+      index,
+      tipo: limpiar(campo(r, ["TIPO ASGIN", "TIPO ASIGN", "TIPO_ASGIN"])) || "SIN TIPO",
+      usuario: limpiar(campo(r, ["USUARIO PICKING", "USUARIO", "OPERADOR"])) || "SIN USUARIO",
+      lpn: limpiar(campo(r, ["NRO LPN", "LPN"])),
+      codigo: limpiar(campo(r, ["CODIGO", "PRODUCTO"])),
+      descripcion: limpiar(campo(r, ["DESCRIPCION", "Descripcion"])),
+      bultos: num(campo(r, ["BULTOS", "Bultos"])),
+      hora,
+      turno: turnoPorHora(hora)
+    };
+  }).filter(reportePickingValido);
+}
+
+function modeloRecepcionReporte() {
+  return (dataRecepcionReporte || []).map((r, index) => {
+    const asn = limpiar(campo(r, ["NRO ASN", "ASN", "Nro ASN"]));
+    const codigoProveedorBase = limpiar(campo(r, ["CODIGO PROVEE", "CODIGO PROVEEDOR", "COD PROVEEDOR"]));
+    const codigoProveedor = codigoProveedorBase || "917";
+    const nombreBase = limpiar(campo(r, ["NOM PROVEEDOR", "NOMBRE PROVEEDOR", "Proveedor"]));
+    const proveedor = nombreBase || (codigoProveedor === "917" ? "PUNTA NEGRA" : "SIN PROVEEDOR");
+    const fecha = fechaValor(campo(r, ["Fe Recepcion", "FE RECEPCION", "FECHA RECEPCION", "FECHA"]));
+    const horaRaw = campo(r, ["HORA RECEPCION", "HORA", "Hora"]);
+    const hora = horaRaw !== "" ? Math.trunc(num(horaRaw)) : horaFecha(fecha);
+    return {
+      index,
+      codigoProveedor,
+      proveedor,
+      proveedorKey: `${codigoProveedor} | ${proveedor}`,
+      oc: limpiar(campo(r, ["NRO OC", "Nro OC", "OC", "ORDEN COMPRA", "Orden Compra"])),
+      asn,
+      lpn: limpiar(campo(r, ["LPN", "NRO LPN", "PALLET", "NroPallet"])),
+      codigo: limpiar(campo(r, ["CODIGO", "PRODUCTO"])),
+      codAlterno: limpiar(campo(r, ["COD ALTER", "COD ALTERN", "COD_ALTER"])),
+      descripcion: limpiar(campo(r, ["DESCRIPCION", "Descripcion"])),
+      programado: num(campo(r, ["BULTOS PROGRAMADOS", "BULTOS PROG", "PROGRAMADO"])),
+      recibido: num(campo(r, ["BULTOS RECIBIDOS", "BULTOS REC", "RECIBIDO"])),
+      unidadesProgramadas: num(campo(r, ["UND PROGRAMADAS", "UNIDADES PROGRAMADAS", "UND PROG"])),
+      unidadesRecibidas: num(campo(r, ["UND RECIBIDAS", "UNIDADES RECIBIDAS", "UND REC"])),
+      usuario: limpiar(campo(r, ["USU RECEP", "USUARIO RECEPCION", "USUARIO"])) || "SIN USUARIO",
+      fecha,
+      hora,
+      turno: turnoPorHora(hora),
+      raw: r
+    };
+  }).filter(r => !normalizar(r.asn).startsWith("ILE"));
+}
+
+function agruparSuma(data, fn, valueFn) {
+  const mapa = new Map();
+  data.forEach(row => {
+    const key = fn(row) || "SIN DATO";
+    if (!mapa.has(key)) mapa.set(key, { label: key, valor: 0, registros: 0 });
+    const item = mapa.get(key);
+    item.valor += valueFn(row);
+    item.registros += 1;
+  });
+  return Array.from(mapa.values()).sort((a, b) => b.valor - a.valor || b.registros - a.registros);
+}
+
+function reporteLineal(titulo, data, total, color = "#315c7a") {
+  const max = Math.max(...data.map(x => x.valor), 1);
+  const points = data.map((x, i) => {
+    const xPos = data.length === 1 ? 500 : 28 + (i / (data.length - 1)) * 944;
+    const yPos = 190 - (x.valor / max) * 160;
+    return { ...x, x: xPos, y: yPos };
+  });
+  const path = points.reduce((d, p, i) => {
+    if (i === 0) return `M ${p.x} ${p.y}`;
+    const prev = points[i - 1];
+    const mid = (prev.x + p.x) / 2;
+    return `${d} C ${mid} ${prev.y}, ${mid} ${p.y}, ${p.x} ${p.y}`;
+  }, "");
+  return `
+    <section class="rf-report-panel rf-chart">
+      <header><h3>${htmlSeguro(titulo)}</h3><strong>${fmt(total)}</strong></header>
+      <svg viewBox="0 0 1000 210" preserveAspectRatio="none">
+        <line x1="25" y1="190" x2="975" y2="190"></line>
+        <line x1="25" y1="136" x2="975" y2="136"></line>
+        <line x1="25" y1="82" x2="975" y2="82"></line>
+        <line x1="25" y1="28" x2="975" y2="28"></line>
+        <path d="${path}" style="stroke:${color}"></path>
+        ${points.map(p => `<circle cx="${p.x}" cy="${p.y}" r="7" style="fill:${color}"></circle>`).join("")}
+      </svg>
+      <div class="rf-axis">${points.map(p => `<span><b>${fmt(p.valor)}</b><small>${htmlSeguro(p.label)}</small></span>`).join("")}</div>
+    </section>
+  `;
+}
+
+function reporteBarras(titulo, data, total) {
+  const max = Math.max(...data.map(x => x.valor), 1);
+  return `
+    <section class="rf-report-panel rf-bars">
+      <header><h3>${htmlSeguro(titulo)}</h3><strong>${fmt(total)}</strong></header>
+      <div>
+        ${data.map(x => `<article><span>${htmlSeguro(x.label)}</span><div><i style="width:${Math.min(100, pct(x.valor, max))}%"></i></div><b>${fmt(x.valor)}</b></article>`).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function reporteRankingUsuarios(data, total) {
+  const top = agruparSuma(data, r => r.usuario, r => r.bultos).slice(0, 10);
+  return `
+    <section class="rf-report-panel rf-ranking">
+      <header><h3>TOP 10 USUARIOS</h3><strong>${fmt(top.length)}</strong></header>
+      ${top.map((x, i) => `
+        <article>
+          <em>${i + 1}</em>
+          <span><b>${htmlSeguro(corto(x.label, 20))}</b><small>${fmt(x.registros)} registros</small></span>
+          <strong>${fmt(x.valor)}</strong>
+          <i style="width:${Math.min(100, pct(x.valor, top[0]?.valor || 1))}%"></i>
+        </article>
+      `).join("") || `<div class="empty-mini">Sin usuarios para mostrar.</div>`}
+    </section>
+  `;
+}
+
+function reporteDonutRecepcion(totalRecibido, diferencia, paleteros, proveedores) {
+  const pendiente = Math.max(0, diferencia);
+  const exceso = Math.max(0, -diferencia);
+  const totalBase = Math.max(totalRecibido + pendiente + exceso, 1);
+  const recibidoPct = pct(totalRecibido, totalBase);
+  const pendientePct = pct(pendiente, totalBase);
+  const excesoPct = pct(exceso, totalBase);
+  const segmentos = [
+    { label: "Recibido", valor: totalRecibido, pct: recibidoPct, color: "#47765a" },
+    { label: "Diferencia", valor: pendiente, pct: pendientePct, color: "#bd7b2a" },
+    { label: "Exceso", valor: exceso, pct: excesoPct, color: "#a24742" }
+  ].filter(x => x.valor > 0 || x.label === "Recibido");
+  let acumulado = 0;
+  const radio = 39;
+  const circ = 2 * Math.PI * radio;
+  const svg = segmentos.map(seg => {
+    const largo = (seg.pct / 100) * circ;
+    const offset = -((acumulado / 100) * circ);
+    acumulado += seg.pct;
+    return `<circle cx="50" cy="50" r="${radio}" fill="none" stroke="${seg.color}" stroke-width="20" stroke-dasharray="${largo} ${Math.max(0, circ - largo)}" stroke-dashoffset="${offset}" transform="rotate(-90 50 50)"></circle>`;
+  }).join("");
+  return `
+    <section class="rf-report-panel rf-reception-mix">
+      <header><h3>COMPOSICION RECEPCION</h3><strong>${pctCumplimiento(totalRecibido, totalBase).toFixed(1)}%</strong></header>
+      <div class="mix-body">
+        <div class="mix-donut">
+          <svg viewBox="0 0 100 100">
+            <circle cx="50" cy="50" r="${radio}" fill="none" stroke="#e5eaf1" stroke-width="20"></circle>
+            ${svg}
+          </svg>
+          <div><strong>${fmt(totalRecibido)}</strong><span>recibido</span></div>
+        </div>
+        <div class="mix-list">
+          ${segmentos.map(seg => `
+            <article style="--tone:${seg.color}">
+              <span>${htmlSeguro(seg.label)}</span>
+              <strong>${fmt(seg.valor)}</strong>
+              <b>${seg.pct.toFixed(1)}%</b>
+            </article>
+          `).join("")}
+          <article style="--tone:#315c7a"><span>Paleteros</span><strong>${fmt(paleteros)}</strong><b>ASN OS917</b></article>
+          <article style="--tone:#172438"><span>Proveedores</span><strong>${fmt(proveedores)}</strong><b>visibles</b></article>
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function esPuntaNegraRecepcionReporte(codigo) {
+  return normalizar(codigo) === "917";
+}
+
+function codigoProveedorResumenRecepcionReporte(row) {
+  return normalizar(campo(row, [
+    "Proveedor",
+    "CODIGO PROVEE",
+    "CODIGO PROVEEDOR",
+    "COD PROVEEDOR",
+    "Codigo Proveedor",
+    "CODIGO_PROVEEDOR"
+  ]));
+}
+
+function bultosResumenProveedorRecepcionReporte(row) {
+  const requerido = num(campo(row, ["Un Req", "UN REQ", "UN_REQ", "Unidades Requeridas"]));
+  if (requerido > 0) return requerido;
+  const bultos = num(campo(row, ["BULTOS", "Bultos", "BULTOS PROGRAMADOS", "PROGRAMADO"]));
+  if (bultos > 0) return bultos;
+  return num(campo(row, ["Un Env", "UN ENV", "UN_ENV", "Unidades Enviadas"]));
+}
+
+function ocResumenProveedorRecepcionReporte(row) {
+  return normalizar(campo(row, ["Nro OC", "NRO OC", "OC", "Orden Compra", "ORDEN COMPRA"]));
+}
+
+function programadoProveedoresResumenRecepcionReporte(ocsRecepcionPorProveedor) {
+  const mapa = new Map();
+  (dataRecepcionProveedoresResumen || []).forEach(row => {
+    const codigo = codigoProveedorResumenRecepcionReporte(row);
+    if (!codigo || esPuntaNegraRecepcionReporte(codigo)) return;
+    const oc = ocResumenProveedorRecepcionReporte(row);
+    const ocsRecepcion = ocsRecepcionPorProveedor?.get(codigo);
+    if (ocsRecepcion?.size && (!oc || !ocsRecepcion.has(oc))) return;
+    const bultos = bultosResumenProveedorRecepcionReporte(row);
+    if (bultos <= 0) return;
+    mapa.set(codigo, (mapa.get(codigo) || 0) + bultos);
+  });
+  return mapa;
+}
+
+function proveedoresResumenReporte(data) {
+  const mapa = new Map();
+  const ocsRecepcionPorProveedor = new Map();
+  data.forEach(r => {
+    const codigoKey = normalizar(r.codigoProveedor);
+    const ocKey = normalizar(r.oc);
+    if (codigoKey && ocKey) {
+      if (!ocsRecepcionPorProveedor.has(codigoKey)) ocsRecepcionPorProveedor.set(codigoKey, new Set());
+      ocsRecepcionPorProveedor.get(codigoKey).add(ocKey);
+    }
+    if (!mapa.has(r.proveedorKey)) {
+      mapa.set(r.proveedorKey, {
+        key: r.proveedorKey,
+        codigo: r.codigoProveedor,
+        proveedor: r.proveedor,
+        programadoReporte: 0,
+        recibido: 0,
+        recibidoUnidades: 0,
+        registros: 0,
+        asns: new Set(),
+        pallets: new Set(),
+        codigos: new Set()
+      });
+    }
+    const item = mapa.get(r.proveedorKey);
+    item.programadoReporte += r.programado;
+    item.recibido += r.recibido;
+    item.recibidoUnidades += r.unidadesRecibidas;
+    item.registros += 1;
+    if (r.asn) item.asns.add(r.asn);
+    if (r.lpn) item.pallets.add(r.lpn);
+    if (r.codigo) item.codigos.add(r.codigo);
+  });
+  const programadoResumen = programadoProveedoresResumenRecepcionReporte(ocsRecepcionPorProveedor);
+  return Array.from(mapa.values()).map(item => {
+    const codigo = normalizar(item.codigo);
+    const programadoProveedor = programadoResumen.get(codigo) || 0;
+    const usaResumenProveedor = !esPuntaNegraRecepcionReporte(codigo) && programadoProveedor > 0;
+    const programado = usaResumenProveedor ? programadoProveedor : item.programadoReporte;
+    const recibido = usaResumenProveedor ? item.recibidoUnidades : item.recibido;
+    return {
+      ...item,
+      programado,
+      recibido,
+      programadoProveedor,
+      fuenteProgramado: usaResumenProveedor ? "PROVEEDORES RESUMEN" : "REPORTE RECEPCION",
+      diferencia: programado - recibido,
+      cumplimiento: pctCumplimiento(recibido, programado),
+      asnUnicos: item.asns.size,
+      palletsTotal: item.pallets.size,
+      codigosTotal: item.codigos.size
+    };
+  }).sort((a, b) => b.recibido - a.recibido);
+}
+
+function proveedoresVisiblesReporte(proveedores) {
+  if (proveedoresReporteSeleccionados === null) return proveedores;
+  return proveedores.filter(p => proveedoresReporteSeleccionados.has(p.key));
+}
+
+function cambiarTurnoReporte(turno) {
+  turnoReportePicking = turno;
+  renderReportes();
+}
+
+function cambiarReporte(vista) {
+  reporteActivo = vista;
+  renderReportes();
+}
+
+function toggleProveedorReporte(key, checked) {
+  if (proveedoresReporteSeleccionados === null) proveedoresReporteSeleccionados = new Set(proveedoresResumenReporte(modeloRecepcionReporte()).map(p => p.key));
+  if (checked) proveedoresReporteSeleccionados.add(key);
+  else proveedoresReporteSeleccionados.delete(key);
+  renderReportes();
+}
+
+function setProveedoresReporte(modo) {
+  proveedoresReporteSeleccionados = modo === "todos" ? null : new Set();
+  renderReportes();
 }
 
 function mostrarApp() {
@@ -62,6 +418,7 @@ async function recargarDatos(forzar = true) {
   if (datosListos && !forzar) {
     estado(`${fmt(dataLPN.length)} LPNs | data lista`);
     if (vistaRf === "validacion") renderValidacionPlusMovil();
+    else if (vistaRf === "reportes") renderReportes();
     else enfocarLpn();
     return;
   }
@@ -74,6 +431,7 @@ async function recargarDatos(forzar = true) {
     await cargarDatos();
     cacheValidacionPlus = null;
     if (vistaRf === "validacion") renderValidacionPlusMovil();
+    else if (vistaRf === "reportes") renderReportes();
     else enfocarLpn();
   } catch (error) {
     estado("Error al cargar data");
@@ -871,6 +1229,136 @@ function renderValidacionPlusMovil() {
   `;
 }
 
+function renderReportePicking() {
+  const dataGeneral = modeloPickingReporte();
+  const data = turnoReportePicking === "TODOS" ? dataGeneral : dataGeneral.filter(r => r.turno === turnoReportePicking);
+  const total = data.reduce((acc, row) => acc + row.bultos, 0);
+  const totalGeneral = dataGeneral.reduce((acc, row) => acc + row.bultos, 0);
+  const usuarios = new Set(data.map(r => r.usuario).filter(Boolean)).size;
+  const lpns = new Set(data.map(r => r.lpn).filter(Boolean)).size;
+  const horas = agruparSuma(data, r => r.hora === null || r.hora === undefined ? "S/H" : `${String(r.hora).padStart(2, "0")}:00`, r => r.bultos)
+    .sort((a, b) => String(a.label).localeCompare(String(b.label), "es", { numeric: true }));
+  const topUsuario = agruparSuma(data, r => r.usuario, r => r.bultos)[0];
+  const horaPico = horas.slice().sort((a, b) => b.valor - a.valor)[0];
+  return `
+    <section class="rf-report-sheet picking">
+      <div class="rotate-hint">Gira el celular para ver el reporte horizontal completo.</div>
+      <div class="rf-report-hero">
+        <div><span>Reporte Picking</span><h2>${htmlSeguro(turnoReportePicking)}</h2></div>
+        <article><span>Total picking</span><strong>${fmt(total)}</strong></article>
+        <article><span>Usuarios</span><strong>${fmt(usuarios)}</strong></article>
+        <article><span>LPNs</span><strong>${fmt(lpns)}</strong></article>
+        <article><span>Prom. hora</span><strong>${fmt(horas.length ? total / horas.length : 0)}</strong></article>
+      </div>
+      <div class="rf-report-controls">
+        ${["TODOS", "DIA", "TARDE", "NOCHE"].map(t => `<button class="${turnoReportePicking === t ? "active" : ""}" onclick="cambiarTurnoReporte('${t}')">${t}</button>`).join("")}
+      </div>
+      <div class="rf-report-highlights">
+        <article><span>Top usuario</span><strong>${htmlSeguro(corto(topUsuario?.label || "-", 18))}</strong><small>${fmt(topUsuario?.valor || 0)} bultos</small></article>
+        <article><span>Hora pico</span><strong>${htmlSeguro(horaPico?.label || "-")}</strong><small>${fmt(horaPico?.valor || 0)} bultos</small></article>
+        <article><span>Participacion</span><strong>${pct(total, totalGeneral).toFixed(1)}%</strong><small>del picking general</small></article>
+      </div>
+      <div class="rf-report-grid">
+        ${reporteLineal(`Tendencia picking - ${turnoReportePicking}`, horas, total, "#5a2db3")}
+        ${reporteBarras("Bultos por hora", horas, total)}
+        ${reporteRankingUsuarios(data, total)}
+      </div>
+    </section>
+  `;
+}
+
+function filtroProveedoresReporte(proveedores) {
+  const visibles = proveedoresVisiblesReporte(proveedores);
+  return `
+    <details class="provider-filter-rf">
+      <summary>Escoger proveedores <b>${fmt(visibles.length)}/${fmt(proveedores.length)}</b></summary>
+      <div class="provider-actions-rf">
+        <button onclick="setProveedoresReporte('todos')">Todos</button>
+        <button onclick="setProveedoresReporte('ninguno')">Ninguno</button>
+      </div>
+      <div class="provider-checks-rf">
+        ${proveedores.map(p => {
+          const checked = proveedoresReporteSeleccionados === null || proveedoresReporteSeleccionados.has(p.key);
+          return `
+            <label>
+              <input type="checkbox" data-key="${atributoSeguro(p.key)}" ${checked ? "checked" : ""} onchange="toggleProveedorReporte(this.dataset.key, this.checked)">
+              <span>${htmlSeguro(corto(p.proveedor, 26))}</span>
+              <b>${fmt(p.recibido)}</b>
+            </label>
+          `;
+        }).join("")}
+      </div>
+    </details>
+  `;
+}
+
+function renderReporteRecepcion() {
+  const data = modeloRecepcionReporte();
+  const proveedores = proveedoresResumenReporte(data);
+  const visibles = proveedoresVisiblesReporte(proveedores);
+  const claves = new Set(visibles.map(p => p.key));
+  const dataVisible = data.filter(row => claves.has(row.proveedorKey));
+  const totalRecibido = visibles.reduce((acc, p) => acc + p.recibido, 0);
+  const totalProgramado = visibles.reduce((acc, p) => acc + p.programado, 0);
+  const diferencia = totalProgramado - totalRecibido;
+  const paleteros = new Set(dataVisible.map(r => r.asn).filter(asn => normalizar(asn).startsWith("OS917")).map(normalizar)).size;
+  const pallets = new Set(dataVisible.map(r => r.lpn).filter(Boolean)).size;
+  const top = visibles.slice(0, 10);
+  return `
+    <section class="rf-report-sheet reception">
+      <div class="rotate-hint">Gira el celular para ver el reporte horizontal completo.</div>
+      <div class="rf-report-hero green">
+        <div><span>Reporte Recepcion</span><h2>Proveedores</h2></div>
+        <article><span>Recibido</span><strong>${fmt(totalRecibido)}</strong></article>
+        <article><span>Programado</span><strong>${fmt(totalProgramado)}</strong></article>
+        <article><span>Diferencia</span><strong>${fmt(diferencia)}</strong></article>
+        <article><span>Cumplimiento</span><strong>${pctCumplimiento(totalRecibido, totalProgramado).toFixed(1)}%</strong></article>
+      </div>
+      <div class="rf-report-highlights">
+        <article><span>Proveedores</span><strong>${fmt(visibles.length)}</strong><small>seleccionados</small></article>
+        <article><span>Paleteros</span><strong>${fmt(paleteros)}</strong><small>ASN OS917 unicos</small></article>
+        <article><span>Pallets</span><strong>${fmt(pallets)}</strong><small>LPN/pallet recepcionados</small></article>
+      </div>
+      ${filtroProveedoresReporte(proveedores)}
+      <div class="rf-report-grid reception-grid">
+        ${reporteDonutRecepcion(totalRecibido, diferencia, paleteros, visibles.length)}
+        <section class="rf-report-panel rf-provider-list">
+          <header><h3>PROVEEDORES</h3><strong>${fmt(visibles.length)}</strong></header>
+          ${top.map(p => `
+            <article class="${p.diferencia === 0 ? "ok" : p.diferencia > 0 ? "warn" : "bad"}">
+              <div><b>${htmlSeguro(corto(p.proveedor, 28))}</b><small>${htmlSeguro(p.codigo)} | ASN ${fmt(p.asnUnicos)} | Pallets ${fmt(p.palletsTotal)}</small></div>
+              <strong>${fmt(p.recibido)}</strong>
+              <span>${p.cumplimiento.toFixed(1)}% | Dif. ${fmt(p.diferencia)}</span>
+            </article>
+          `).join("") || `<div class="empty-mini">Sin proveedores seleccionados.</div>`}
+        </section>
+      </div>
+    </section>
+  `;
+}
+
+function renderReportes() {
+  if (!datosListos) {
+    mostrarMensaje("Data cargando", "Espera unos segundos y vuelve a abrir reportes.");
+    return;
+  }
+  document.getElementById("resultado").innerHTML = `
+    <article class="result-card reports-module">
+      <div class="result-head">
+        <span>Modulo RF</span>
+        <strong>Reportes</strong>
+      </div>
+      <div class="report-tabs">
+        <button class="${reporteActivo === "picking" ? "active" : ""}" onclick="cambiarReporte('picking')">Picking</button>
+        <button class="${reporteActivo === "recepcion" ? "active" : ""}" onclick="cambiarReporte('recepcion')">Recepcion</button>
+      </div>
+      <div class="report-scroll">
+        ${reporteActivo === "picking" ? renderReportePicking() : renderReporteRecepcion()}
+      </div>
+    </article>
+  `;
+}
+
 function verDetalleValidacionRf(index) {
   const row = obtenerValidacionPlusRf()[Number(index)];
   if (!row) return;
@@ -924,12 +1412,17 @@ function verDetalleValidacionRf(index) {
 
 function cambiarVistaRf(vista) {
   vistaRf = vista;
+  document.getElementById("appView")?.classList.toggle("report-mode", vista === "reportes");
   document.getElementById("tabConsulta").classList.toggle("active", vista === "consulta");
   document.getElementById("tabValidacion").classList.toggle("active", vista === "validacion");
+  document.getElementById("tabReportes").classList.toggle("active", vista === "reportes");
   document.querySelector(".scan-panel").hidden = vista !== "consulta";
   if (vista === "validacion") {
     detenerCamara();
     renderValidacionPlusMovil();
+  } else if (vista === "reportes") {
+    detenerCamara();
+    renderReportes();
   } else {
     mostrarMensaje("Listo para consulta", "Escanea un codigo de barras de LPN.");
     enfocarLpn();
@@ -1259,6 +1752,7 @@ document.getElementById("cameraButton").addEventListener("click", alternarCamara
 document.getElementById("resultado").addEventListener("click", manejarClickResultado);
 document.getElementById("tabConsulta").addEventListener("click", () => cambiarVistaRf("consulta"));
 document.getElementById("tabValidacion").addEventListener("click", () => cambiarVistaRf("validacion"));
+document.getElementById("tabReportes").addEventListener("click", () => cambiarVistaRf("reportes"));
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) detenerCamara();
 });
