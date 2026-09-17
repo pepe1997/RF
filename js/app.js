@@ -15,6 +15,12 @@ let reporteActivo = "picking";
 let turnoReportePicking = "TODOS";
 let proveedoresReporteSeleccionados = null;
 
+function limpiarSeleccionConsulta() {
+  lpnActualRows = [];
+  productosActuales = [];
+  codigoSeleccionado = "";
+}
+
 function estado(texto) {
   const el = document.getElementById("estadoCarga");
   if (el) el.textContent = texto;
@@ -462,10 +468,12 @@ function buscarConsulta(valor) {
   const q = normalizar(valor);
   if (!q) return enfocarLpn();
   if (!datosListos) {
+    limpiarSeleccionConsulta();
     mostrarMensaje("Data cargando", "Espera unos segundos y vuelve a escanear.");
     return;
   }
 
+  limpiarSeleccionConsulta();
   const rows = dataLPN.filter(row => normalizar(row.lpn) === q);
   document.getElementById("lpnInput").value = "";
   ocultarSugerencias();
@@ -695,6 +703,11 @@ function ocultarSugerencias() {
 function manejarClickSugerencia(event) {
   const boton = event.target.closest(".suggestion-item");
   if (!boton) return;
+  if (event.type === "click" && boton.dataset.pointerHandled === "1") return;
+  if (event.type === "pointerdown") boton.dataset.pointerHandled = "1";
+  event.preventDefault();
+  event.stopPropagation();
+  clearTimeout(timerSugerencias);
   buscarConsulta(boton.dataset.value || "");
 }
 
@@ -723,39 +736,63 @@ function consolidarProductosLpn(rows) {
   return Array.from(mapa.values()).sort((a, b) => b.bultos - a.bultos || a.codigo.localeCompare(b.codigo));
 }
 
+function codigosComparablesProducto(producto) {
+  return new Set([
+    normalizar(producto?.codigo),
+    normalizar(producto?.codigoAlt)
+  ].filter(Boolean));
+}
+
+function inventarioCoincideProducto(row, producto) {
+  const claves = codigosComparablesProducto(producto);
+  const codigo = normalizar(row.codigo);
+  const codigoAlt = normalizar(row.codigoAlt);
+  return (codigo && claves.has(codigo)) || (codigoAlt && claves.has(codigoAlt));
+}
+
 function activoProducto(producto) {
   const agrupado = new Map();
   dataInventario
-    .filter(row => row.codigo === producto.codigo && row.ubicacion)
+    .filter(row => inventarioCoincideProducto(row, producto) && row.ubicacion)
     .forEach(row => {
-      const key = row.ubicacion;
+      const key = `${normalizar(row.codigo || producto.codigo)}|${normalizar(row.ubicacion)}`;
       if (!agrupado.has(key)) {
         agrupado.set(key, {
           ubicacion: row.ubicacion,
-          codigo: row.codigo,
-          unidades: 0,
-          bultos: 0,
-          uniAsig: 0,
-          transito: 0,
+          codigo: producto.codigo,
+          codigoAlt: producto.codigoAlt || row.codigoAlt || "",
+          descripcion: producto.descripcion || row.descripcion || "",
           uniMax: 0,
+          capacidadDinamica: false,
+          asignado: 0,
+          transito: 0,
+          bultos: 0,
+          unidades: 0,
+          disponibleUnidades: 0,
+          disponibleBultos: 0,
+          filas: 0,
           uxb: row.uxb || producto.uxb || 1
         });
       }
       const item = agrupado.get(key);
+      const uxb = row.uxb || item.uxb || producto.uxb || 1;
       item.unidades += row.unact;
       item.bultos += row.bultos;
-      item.uniAsig += row.uniAsig;
+      item.asignado += row.uniAsig;
       item.transito += row.transito;
       item.uniMax = Math.max(item.uniMax, row.uniMax);
-      item.uxb = row.uxb || item.uxb || 1;
+      item.capacidadDinamica = item.capacidadDinamica || esCapacidadDinamica(row.uniMax);
+      item.uxb = uxb;
+      item.filas += 1;
     });
 
   return Array.from(agrupado.values()).map(row => {
-    const disp = disponibilidadPorCapacidad(row.uniMax, row.unidades, row.transito, row.uxb);
+    const disp = disponibilidadPorCapacidad(row.capacidadDinamica ? 0 : row.uniMax, row.unidades, row.transito, row.uxb);
     const faltaUnd = disp.dinamica ? 0 : Math.max(0, producto.unidades - disp.disponibleUnd);
     const faltaBul = disp.dinamica ? 0 : Math.max(0, producto.bultos - disp.disponibleBul);
     return {
       ...row,
+      uniAsig: row.asignado,
       capacidadDinamica: disp.dinamica,
       disponibleUnidades: disp.disponibleUnd,
       disponibleBultos: disp.disponibleBul,
@@ -1745,6 +1782,7 @@ document.getElementById("loginForm").addEventListener("submit", validarLogin);
 document.getElementById("scanForm").addEventListener("submit", buscarManual);
 document.getElementById("lpnInput").addEventListener("input", programarSugerenciasBusqueda);
 document.getElementById("lpnInput").addEventListener("blur", () => setTimeout(ocultarSugerencias, 180));
+document.getElementById("sugerenciasBusqueda").addEventListener("pointerdown", manejarClickSugerencia);
 document.getElementById("sugerenciasBusqueda").addEventListener("click", manejarClickSugerencia);
 document.getElementById("refreshButton").addEventListener("click", () => recargarDatos(true));
 document.getElementById("logoutButton").addEventListener("click", salir);
