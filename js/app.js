@@ -217,6 +217,113 @@ function reporteRankingUsuarios(data, total) {
   `;
 }
 
+function horasPickingReporte(data) {
+  return agruparSuma(data, r => r.hora === null || r.hora === undefined ? "S/H" : `${String(r.hora).padStart(2, "0")}:00`, r => r.bultos)
+    .sort((a, b) => String(a.label).localeCompare(String(b.label), "es", { numeric: true }));
+}
+
+function usuariosPickingReporte(data) {
+  const mapa = new Map();
+  data.forEach(row => {
+    const usuario = row.usuario || "SIN USUARIO";
+    if (!mapa.has(usuario)) {
+      mapa.set(usuario, {
+        usuario,
+        bultos: 0,
+        registros: 0,
+        lpns: new Set(),
+        turnos: new Map()
+      });
+    }
+    const item = mapa.get(usuario);
+    item.bultos += row.bultos;
+    item.registros += 1;
+    if (row.lpn) item.lpns.add(row.lpn);
+    item.turnos.set(row.turno, (item.turnos.get(row.turno) || 0) + row.bultos);
+  });
+  return Array.from(mapa.values()).map(item => ({
+    ...item,
+    lpnsTotal: item.lpns.size,
+    turnosDetalle: Array.from(item.turnos.entries()).sort((a, b) => {
+      const orden = { DIA: 1, TARDE: 2, NOCHE: 3, "SIN TURNO": 4 };
+      return (orden[a[0]] || 99) - (orden[b[0]] || 99);
+    })
+  })).sort((a, b) => b.bultos - a.bultos || b.registros - a.registros);
+}
+
+function tendenciaPickingMovil(data, total) {
+  if (!data.length) return `<section class="rf-mobile-card"><div class="empty-mini">Sin datos horarios para este turno.</div></section>`;
+  const width = 420;
+  const height = 240;
+  const left = 34;
+  const right = 28;
+  const top = 42;
+  const bottom = 48;
+  const plotW = width - left - right;
+  const plotH = height - top - bottom;
+  const max = Math.max(...data.map(x => x.valor), 1);
+  const points = data.map((item, index) => ({
+    ...item,
+    x: data.length === 1 ? left + plotW / 2 : left + (plotW * index / (data.length - 1)),
+    y: top + plotH - (item.valor / max) * plotH
+  }));
+  const path = points.reduce((d, p, index) => {
+    if (index === 0) return `M ${p.x} ${p.y}`;
+    const prev = points[index - 1];
+    const mid = (prev.x + p.x) / 2;
+    return `${d} C ${mid} ${prev.y}, ${mid} ${p.y}, ${p.x} ${p.y}`;
+  }, "");
+  return `
+    <section class="rf-mobile-card rf-mobile-trend">
+      <div class="rf-mobile-section-title">
+        <h3>Tendencia picking</h3>
+        <strong>${fmt(total)}</strong>
+      </div>
+      <svg viewBox="0 0 ${width} ${height}" aria-label="Tendencia de bultos por hora">
+        <g class="mobile-grid">
+          <line x1="${left}" y1="${top}" x2="${width - right}" y2="${top}"></line>
+          <line x1="${left}" y1="${top + plotH / 2}" x2="${width - right}" y2="${top + plotH / 2}"></line>
+          <line x1="${left}" y1="${top + plotH}" x2="${width - right}" y2="${top + plotH}"></line>
+        </g>
+        <path d="${path}"></path>
+        ${points.map(p => `
+          <g>
+            <rect x="${p.x - 31}" y="${Math.max(6, p.y - 36)}" width="62" height="24" rx="7"></rect>
+            <text x="${p.x}" y="${Math.max(6, p.y - 36) + 16}" text-anchor="middle">${fmt(p.valor)}</text>
+            <circle cx="${p.x}" cy="${p.y}" r="6"></circle>
+            <text class="hour" x="${p.x}" y="${height - 15}" text-anchor="middle">${htmlSeguro(p.label)}</text>
+          </g>
+        `).join("")}
+      </svg>
+    </section>
+  `;
+}
+
+function detalleUsuariosPickingMovil(data, total) {
+  const usuarios = usuariosPickingReporte(data);
+  return `
+    <section class="rf-mobile-card rf-mobile-users">
+      <div class="rf-mobile-section-title">
+        <h3>Usuarios que pickaron</h3>
+        <strong>${fmt(usuarios.length)}</strong>
+      </div>
+      <div class="rf-mobile-user-list">
+        ${usuarios.map((u, index) => `
+          <article>
+            <em>${index + 1}</em>
+            <div>
+              <strong>${htmlSeguro(u.usuario)}</strong>
+              <small>${fmt(u.lpnsTotal)} LPNs | ${fmt(u.registros)} registros | ${pct(u.bultos, total).toFixed(1)}%</small>
+              <span>${u.turnosDetalle.map(([turno, valor]) => `<b class="${turno.toLowerCase().replace(/\s/g, "-")}">${htmlSeguro(turno)} ${fmt(valor)}</b>`).join("")}</span>
+            </div>
+            <strong>${fmt(u.bultos)}</strong>
+          </article>
+        `).join("") || `<div class="empty-mini">Sin usuarios para este turno.</div>`}
+      </div>
+    </section>
+  `;
+}
+
 function reporteDonutRecepcion(totalRecibido, diferencia, paleteros, proveedores) {
   const pendiente = Math.max(0, diferencia);
   const exceso = Math.max(0, -diferencia);
@@ -1270,36 +1377,27 @@ function renderReportePicking() {
   const dataGeneral = modeloPickingReporte();
   const data = turnoReportePicking === "TODOS" ? dataGeneral : dataGeneral.filter(r => r.turno === turnoReportePicking);
   const total = data.reduce((acc, row) => acc + row.bultos, 0);
-  const totalGeneral = dataGeneral.reduce((acc, row) => acc + row.bultos, 0);
-  const usuarios = new Set(data.map(r => r.usuario).filter(Boolean)).size;
-  const lpns = new Set(data.map(r => r.lpn).filter(Boolean)).size;
-  const horas = agruparSuma(data, r => r.hora === null || r.hora === undefined ? "S/H" : `${String(r.hora).padStart(2, "0")}:00`, r => r.bultos)
-    .sort((a, b) => String(a.label).localeCompare(String(b.label), "es", { numeric: true }));
-  const topUsuario = agruparSuma(data, r => r.usuario, r => r.bultos)[0];
+  const horas = horasPickingReporte(data);
   const horaPico = horas.slice().sort((a, b) => b.valor - a.valor)[0];
+  const promedioHora = horas.length ? total / horas.length : 0;
   return `
-    <section class="rf-report-sheet picking">
-      <div class="rotate-hint">Gira el celular para ver el reporte horizontal completo.</div>
-      <div class="rf-report-hero">
-        <div><span>Reporte Picking</span><h2>${htmlSeguro(turnoReportePicking)}</h2></div>
-        <article><span>Total picking</span><strong>${fmt(total)}</strong></article>
-        <article><span>Usuarios</span><strong>${fmt(usuarios)}</strong></article>
-        <article><span>LPNs</span><strong>${fmt(lpns)}</strong></article>
-        <article><span>Prom. hora</span><strong>${fmt(horas.length ? total / horas.length : 0)}</strong></article>
+    <section class="rf-report-sheet picking rf-mobile-picking">
+      <div class="rf-mobile-title">
+        <span>Modulo RF</span>
+        <h2>Reporte de Picking</h2>
       </div>
-      <div class="rf-report-controls">
-        ${["TODOS", "DIA", "TARDE", "NOCHE"].map(t => `<button class="${turnoReportePicking === t ? "active" : ""}" onclick="cambiarTurnoReporte('${t}')">${t}</button>`).join("")}
-      </div>
-      <div class="rf-report-highlights">
-        <article><span>Top usuario</span><strong>${htmlSeguro(corto(topUsuario?.label || "-", 18))}</strong><small>${fmt(topUsuario?.valor || 0)} bultos</small></article>
+      <label class="rf-mobile-filter">Turno
+        <select onchange="cambiarTurnoReporte(this.value)">
+          ${["TODOS", "DIA", "TARDE", "NOCHE"].map(t => `<option value="${t}" ${turnoReportePicking === t ? "selected" : ""}>${t}</option>`).join("")}
+        </select>
+      </label>
+      <div class="rf-mobile-kpis">
+        <article><span>Total bultos pickados</span><strong>${fmt(total)}</strong></article>
         <article><span>Hora pico</span><strong>${htmlSeguro(horaPico?.label || "-")}</strong><small>${fmt(horaPico?.valor || 0)} bultos</small></article>
-        <article><span>Participacion</span><strong>${pct(total, totalGeneral).toFixed(1)}%</strong><small>del picking general</small></article>
+        <article><span>Promedio x hora</span><strong>${fmt(promedioHora)}</strong><small>${fmt(horas.length)} horas activas</small></article>
       </div>
-      <div class="rf-report-grid">
-        ${reporteLineal(`Tendencia picking - ${turnoReportePicking}`, horas, total, "#5a2db3")}
-        ${reporteBarras("Bultos por hora", horas, total)}
-        ${reporteRankingUsuarios(data, total)}
-      </div>
+      ${tendenciaPickingMovil(horas, total)}
+      ${detalleUsuariosPickingMovil(data, total)}
     </section>
   `;
 }
