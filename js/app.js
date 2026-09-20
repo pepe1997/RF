@@ -1,6 +1,9 @@
 const RF_USER = "SCANER";
 const RF_PASS = "1234";
 const CAPACIDAD_DINAMICA_UND = 999999;
+const TRABAJO_API_URL = "https://script.google.com/macros/s/AKfycbx3KCscftCBQkO0TUi6Po9bLvRHdL1d7_RL9Ua7__C3LmISFlqs-YRjl-qFNwGtf3UA/exec";
+const TRABAJO_API_STORAGE_KEY = "rf_trabajo_api_url";
+const TRABAJO_POLL_MS = 5000;
 
 let scannerStream = null;
 let scannerDetector = null;
@@ -13,7 +16,129 @@ let vistaRf = "consulta";
 let cacheValidacionPlus = null;
 let reporteActivo = "picking";
 let turnoReportePicking = "TODOS";
+let turnoReporteRecepcion = "TODOS";
+let turnoReporteDespacho = "TODOS";
 let proveedoresReporteSeleccionados = null;
+let estadoAsignacionOperativa = JSON.parse(localStorage.getItem("rf_asignacion_operativa_estado") || "{}");
+let filtroTrabajoAsignacion = "";
+let timerFiltroTrabajoAsignacion = null;
+let timerSincronizacionTrabajo = null;
+let sincronizandoTrabajo = false;
+let guardandoTrabajo = new Set();
+let operadorTrabajo = localStorage.getItem("rf_trabajo_operador") || "";
+let estadoTrabajoRemoto = {};
+let tareasTrabajoRegistradas = false;
+
+function urlApiTrabajo() {
+  const guardada = String(localStorage.getItem(TRABAJO_API_STORAGE_KEY) || "").trim();
+  return /^https:\/\/script\.google\.com\/macros\/s\/.+\/exec(?:\?.*)?$/i.test(guardada)
+    ? guardada
+    : TRABAJO_API_URL;
+}
+
+function apiTrabajoDisponible() {
+  return /^https:\/\/script\.google\.com\/macros\/s\/.+\/exec(?:\?.*)?$/i.test(urlApiTrabajo());
+}
+
+async function leerAvanceTrabajoHoja() {
+  const filas = await cargarHojaDesde(TRABAJO_SHEET_ID, "AVANCE_TRABAJO");
+  const estados = {};
+  filas.forEach(row => {
+    const clave = limpiar(campo(row, ["CLAVE"]));
+    if (!clave) return;
+    estados[clave] = {
+      estado: normalizar(campo(row, ["ESTADO"]) || "PENDIENTE"),
+      operador: limpiar(campo(row, ["OPERADOR"])),
+      actualizado: limpiar(campo(row, ["ACTUALIZADO"])),
+      origen: limpiar(campo(row, ["ORIGEN"])),
+      codigo: limpiar(campo(row, ["CODIGO"])),
+      ubicacion: limpiar(campo(row, ["UBICACION"])),
+      lpn: limpiar(campo(row, ["LPN"])),
+      bultos: num(campo(row, ["BULTOS"]))
+    };
+  });
+  return estados;
+}
+
+async function leerEstadoTrabajoRemoto() {
+  if (!apiTrabajoDisponible() || sincronizandoTrabajo) return;
+  sincronizandoTrabajo = true;
+  try {
+    let remotos = {};
+    try {
+      // La hoja conserva los decimales exactos; se prioriza sobre la respuesta antigua de la API.
+      remotos = await leerAvanceTrabajoHoja();
+    } catch (hojaError) {
+      console.warn("No se pudo leer AVANCE_TRABAJO directamente:", hojaError.message || hojaError);
+    }
+    if (!Object.keys(remotos).length) {
+      try {
+        const url = new URL(urlApiTrabajo());
+        url.searchParams.set("action", "ESTADO");
+        url.searchParams.set("_", Date.now());
+        const response = await fetch(url, { cache: "no-store" });
+        const data = await response.json();
+        if (!response.ok || data.ok === false) throw new Error(data.mensaje || "No se pudo leer el avance remoto.");
+        remotos = data.estados || {};
+      } catch (apiError) {
+        console.warn("API Trabajo no disponible:", apiError.message || apiError);
+      }
+    }
+    estadoTrabajoRemoto = remotos;
+    const tareas = datosOperativosListos ? procesarAsignacionOperacionalRf() : { reserva: [], otras: [] };
+    [...tareas.reserva, ...tareas.otras].forEach(row => {
+      const key = claveAsignacionOperativa(row);
+      estadoAsignacionOperativa[key] = normalizar(remotos[key]?.estado) === "COMPLETO" ? "completo" : "pendiente";
+    });
+    localStorage.setItem("rf_asignacion_operativa_estado", JSON.stringify(estadoAsignacionOperativa));
+    if (vistaRf === "trabajo" && datosOperativosListos) renderTrabajoAsignacionMovil();
+    else if (vistaRf === "dashboard") renderDashboardTrabajo();
+  } catch (error) {
+    console.warn("No se pudo sincronizar Trabajo:", error.message || error);
+  } finally {
+    sincronizandoTrabajo = false;
+  }
+}
+
+function iniciarSincronizacionTrabajo() {
+  if (!apiTrabajoDisponible() || timerSincronizacionTrabajo) return;
+  leerEstadoTrabajoRemoto();
+  timerSincronizacionTrabajo = setInterval(() => {
+    if (vistaRf === "trabajo" || vistaRf === "dashboard") leerEstadoTrabajoRemoto();
+  }, TRABAJO_POLL_MS);
+}
+
+function detenerSincronizacionTrabajo() {
+  if (!timerSincronizacionTrabajo) return;
+  clearInterval(timerSincronizacionTrabajo);
+  timerSincronizacionTrabajo = null;
+}
+
+async function registrarTareasTrabajoRemoto() {
+  if (!apiTrabajoDisponible() || tareasTrabajoRegistradas || !datosOperativosListos) return;
+  const data = procesarAsignacionOperacionalRf();
+  const tareas = [...data.reserva, ...data.otras].map(row => ({
+    clave: claveAsignacionOperativa(row),
+    origen: row.origen,
+    codigo: row.codigo,
+    ubicacion: row.ubicacion,
+    lpn: row.lpn,
+    bultos: row.asignar
+  }));
+  try {
+    const response = await fetch(urlApiTrabajo(), {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ action: "REGISTRAR_TAREAS", tareas })
+    });
+    const result = await response.json();
+    if (!response.ok || result.ok === false) throw new Error(result.mensaje || "No se pudieron registrar las tareas.");
+    tareasTrabajoRegistradas = true;
+    leerEstadoTrabajoRemoto();
+  } catch (error) {
+    console.warn("No se pudieron registrar las tareas remotas:", error.message || error);
+  }
+}
 
 function limpiarSeleccionConsulta() {
   lpnActualRows = [];
@@ -52,16 +177,82 @@ function pctCumplimiento(valor, total) {
 function fechaValor(valor) {
   const texto = limpiar(valor);
   if (!texto) return null;
+  const serial = Number(texto);
+  if (Number.isFinite(serial) && serial > 20000 && serial < 80000) {
+    return new Date(Math.round((serial - 25569) * 86400 * 1000));
+  }
   const iso = texto.replace(" ", "T");
   const fecha = new Date(iso);
   if (!Number.isNaN(fecha.getTime())) return fecha;
-  const partes = texto.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:\s+(\d{1,2}):(\d{2}))?/);
-  if (!partes) return null;
-  return new Date(Number(partes[3]), Number(partes[2]) - 1, Number(partes[1]), Number(partes[4] || 0), Number(partes[5] || 0));
+  const limpio = texto
+    .replace(/\ba\.\s*m\.?\b/gi, "AM")
+    .replace(/\bp\.\s*m\.?\b/gi, "PM")
+    .replace(/\bam\b/gi, "AM")
+    .replace(/\bpm\b/gi, "PM");
+  let partes = limpio.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})(?:[,\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?)?/i);
+  let anio;
+  let mes;
+  let dia;
+  let horaTexto;
+  let minutoTexto;
+  let segundoTexto;
+  let ampmTexto;
+  if (partes) {
+    const primero = Number(partes[1]);
+    const segundo = Number(partes[2]);
+    anio = Number(partes[3]);
+    if (anio < 100) anio += 2000;
+    if (segundo > 12 && primero <= 12) {
+      mes = primero - 1;
+      dia = segundo;
+    } else {
+      dia = primero;
+      mes = segundo - 1;
+    }
+    horaTexto = partes[4];
+    minutoTexto = partes[5];
+    segundoTexto = partes[6];
+    ampmTexto = partes[7];
+  } else {
+    partes = limpio.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T,\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?)?/i);
+    if (!partes) return null;
+    anio = Number(partes[1]);
+    mes = Number(partes[2]) - 1;
+    dia = Number(partes[3]);
+    horaTexto = partes[4];
+    minutoTexto = partes[5];
+    segundoTexto = partes[6];
+    ampmTexto = partes[7];
+  }
+  let hora = Number(horaTexto || 0);
+  const ampm = normalizar(ampmTexto);
+  if (ampm === "PM" && hora < 12) hora += 12;
+  if (ampm === "AM" && hora === 12) hora = 0;
+  return new Date(anio, mes, dia, hora, Number(minutoTexto || 0), Number(segundoTexto || 0));
 }
 
 function horaFecha(fecha) {
   return fecha ? fecha.getHours() : null;
+}
+
+function horaValor(valor) {
+  const texto = limpiar(valor);
+  if (!texto) return null;
+  const fecha = fechaValor(texto);
+  if (fecha) return horaFecha(fecha);
+  const limpio = texto
+    .replace(/\ba\.\s*m\.?\b/gi, "AM")
+    .replace(/\bp\.\s*m\.?\b/gi, "PM")
+    .replace(/\bam\b/gi, "AM")
+    .replace(/\bpm\b/gi, "PM");
+  const partes = limpio.match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?/i);
+  if (!partes) return null;
+  let hora = Number(partes[1]);
+  const ampm = normalizar(partes[3]);
+  if (!Number.isFinite(hora)) return null;
+  if (ampm === "PM" && hora < 12) hora += 12;
+  if (ampm === "AM" && hora === 12) hora = 0;
+  return hora >= 0 && hora <= 23 ? hora : null;
 }
 
 function turnoPorHora(hora) {
@@ -251,14 +442,14 @@ function usuariosPickingReporte(data) {
   })).sort((a, b) => b.bultos - a.bultos || b.registros - a.registros);
 }
 
-function tendenciaPickingMovil(data, total) {
-  if (!data.length) return `<section class="rf-mobile-card"><div class="empty-mini">Sin datos horarios para este turno.</div></section>`;
+function tendenciaPickingMovil(data, total, titulo = "Tendencia picking", etiquetaVacia = "Sin datos horarios para este turno.") {
+  if (!data.length) return `<section class="rf-mobile-card"><div class="empty-mini">${htmlSeguro(etiquetaVacia)}</div></section>`;
   const width = 420;
-  const height = 240;
+  const height = 285;
   const left = 34;
   const right = 28;
-  const top = 42;
-  const bottom = 48;
+  const top = 58;
+  const bottom = 64;
   const plotW = width - left - right;
   const plotH = height - top - bottom;
   const max = Math.max(...data.map(x => x.valor), 1);
@@ -273,10 +464,11 @@ function tendenciaPickingMovil(data, total) {
     const mid = (prev.x + p.x) / 2;
     return `${d} C ${mid} ${prev.y}, ${mid} ${p.y}, ${p.x} ${p.y}`;
   }, "");
+  const pico = points.slice().sort((a, b) => b.valor - a.valor)[0];
   return `
     <section class="rf-mobile-card rf-mobile-trend">
       <div class="rf-mobile-section-title">
-        <h3>Tendencia picking</h3>
+        <h3>${htmlSeguro(titulo)}</h3>
         <strong>${fmt(total)}</strong>
       </div>
       <svg viewBox="0 0 ${width} ${height}" aria-label="Tendencia de bultos por hora">
@@ -287,14 +479,90 @@ function tendenciaPickingMovil(data, total) {
         </g>
         <path d="${path}"></path>
         ${points.map(p => `
-          <g>
-            <rect x="${p.x - 31}" y="${Math.max(6, p.y - 36)}" width="62" height="24" rx="7"></rect>
-            <text x="${p.x}" y="${Math.max(6, p.y - 36) + 16}" text-anchor="middle">${fmt(p.valor)}</text>
+          <g class="${p === pico ? "peak" : ""}">
+            ${p === pico ? `
+              <rect x="${p.x - 38}" y="${Math.max(8, p.y - 47)}" width="76" height="28" rx="8"></rect>
+              <text x="${p.x}" y="${Math.max(8, p.y - 47) + 19}" text-anchor="middle">${fmt(p.valor)}</text>
+            ` : ""}
             <circle cx="${p.x}" cy="${p.y}" r="6"></circle>
             <text class="hour" x="${p.x}" y="${height - 15}" text-anchor="middle">${htmlSeguro(p.label)}</text>
           </g>
         `).join("")}
       </svg>
+      <div class="rf-mobile-hour-chips">
+        ${points.map(p => `<span class="${p === pico ? "peak" : ""}"><b>${htmlSeguro(p.label)}</b><strong>${fmt(p.valor)}</strong></span>`).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function iconoRf(tipo) {
+  const base = {
+    total: `<path d="M5 11h14M5 7h14M5 15h10"></path>`,
+    hora: `<circle cx="12" cy="12" r="8"></circle><path d="M12 8v5l3 2"></path>`,
+    promedio: `<path d="M4 18V6m5 12V9m5 9V4m5 14v-7"></path>`,
+    recibido: `<path d="M4 7l8-4 8 4-8 4-8-4z"></path><path d="M4 7v10l8 4 8-4V7"></path><path d="M12 11v10"></path>`,
+    cumplimiento: `<path d="M5 13l4 4L19 7"></path>`,
+    proveedor: `<path d="M4 18c1.5-3 4-5 8-5s6.5 2 8 5"></path><circle cx="12" cy="8" r="4"></circle>`,
+    viaje: `<path d="M3 8h12v7H3z"></path><path d="M15 10h3l3 3v2h-6z"></path><circle cx="7" cy="17" r="2"></circle><circle cx="18" cy="17" r="2"></circle>`,
+    pallet: `<path d="M5 6h14v10H5z"></path><path d="M5 11h14M8 16v3m8-3v3"></path>`,
+    tienda: `<path d="M4 10h16l-2-5H6l-2 5z"></path><path d="M6 10v9h12v-9"></path><path d="M10 19v-5h4v5"></path>`,
+    costo: `<path d="M12 3v18"></path><path d="M17 7c-1-2-8-2-8 1 0 4 8 2 8 6 0 3-7 3-9 1"></path>`,
+    grafico: `<path d="M4 19V5"></path><path d="M4 19h16"></path><path d="M7 15l3-4 3 2 5-7"></path>`
+  };
+  return `<svg viewBox="0 0 24 24" aria-hidden="true">${base[tipo] || base.total}</svg>`;
+}
+
+function kpiMovil(icono, label, valor, nota = "") {
+  return `
+    <article>
+      <i class="rf-kpi-icon">${iconoRf(icono)}</i>
+      <span>${htmlSeguro(label)}</span>
+      <strong>${valor}</strong>
+      ${nota ? `<small>${nota}</small>` : ""}
+    </article>
+  `;
+}
+
+function pastelMovil(titulo, data, total, centro = "") {
+  const filtrada = data.filter(x => x.valor > 0);
+  if (!filtrada.length) return `<section class="rf-mobile-card"><div class="empty-mini">Sin datos para graficar ${htmlSeguro(titulo.toLowerCase())}.</div></section>`;
+  const colores = ["#47765a", "#d39a36", "#5a2db3", "#315c7a", "#a24742", "#64748b"];
+  const radio = 42;
+  const circ = 2 * Math.PI * radio;
+  let acumulado = 0;
+  const segmentos = filtrada.map((item, index) => {
+    const porcentaje = pct(item.valor, total);
+    const largo = (porcentaje / 100) * circ;
+    const offset = -((acumulado / 100) * circ);
+    acumulado += porcentaje;
+    return `<circle cx="60" cy="60" r="${radio}" fill="none" stroke="${colores[index % colores.length]}" stroke-width="19" stroke-dasharray="${largo} ${Math.max(0, circ - largo)}" stroke-dashoffset="${offset}" transform="rotate(-90 60 60)"></circle>`;
+  }).join("");
+  return `
+    <section class="rf-mobile-card rf-mobile-pie-card">
+      <div class="rf-mobile-section-title">
+        <h3>${htmlSeguro(titulo)}</h3>
+        <strong>${fmt(total)}</strong>
+      </div>
+      <div class="rf-mobile-pie-body">
+        <svg viewBox="0 0 120 120" class="rf-mobile-pie">
+          <circle cx="60" cy="60" r="${radio}" fill="none" stroke="#e7edf4" stroke-width="19"></circle>
+          ${segmentos}
+          <circle cx="60" cy="60" r="28" fill="#fff"></circle>
+          <text x="60" y="57" text-anchor="middle">${htmlSeguro(centro || fmt(total))}</text>
+          <text x="60" y="72" text-anchor="middle" class="sub">total</text>
+        </svg>
+        <div class="rf-mobile-pie-legend">
+          ${filtrada.map((item, index) => `
+            <span>
+              <i style="background:${colores[index % colores.length]}"></i>
+              <b>${htmlSeguro(item.label)}</b>
+              <strong>${fmt(item.valor)}</strong>
+              <small>${pct(item.valor, total).toFixed(1)}%</small>
+            </span>
+          `).join("")}
+        </div>
+      </div>
     </section>
   `;
 }
@@ -319,6 +587,399 @@ function detalleUsuariosPickingMovil(data, total) {
             <strong>${fmt(u.bultos)}</strong>
           </article>
         `).join("") || `<div class="empty-mini">Sin usuarios para este turno.</div>`}
+      </div>
+    </section>
+  `;
+}
+
+function horasValorReporte(data, valueFn) {
+  return agruparSuma(data, r => r.hora === null || r.hora === undefined ? "S/H" : `${String(r.hora).padStart(2, "0")}:00`, valueFn)
+    .sort((a, b) => String(a.label).localeCompare(String(b.label), "es", { numeric: true }));
+}
+
+function usuariosOperacionMovil(data, total, titulo, valueFn, unidad = "bultos") {
+  const mapa = new Map();
+  data.forEach(row => {
+    const usuario = row.usuario || "SIN USUARIO";
+    if (!mapa.has(usuario)) {
+      mapa.set(usuario, { usuario, valor: 0, registros: 0, turnos: new Map() });
+    }
+    const item = mapa.get(usuario);
+    const valor = valueFn(row);
+    item.valor += valor;
+    item.registros += 1;
+    item.turnos.set(row.turno, (item.turnos.get(row.turno) || 0) + valor);
+  });
+  const usuarios = Array.from(mapa.values()).map(item => ({
+    ...item,
+    turnosDetalle: Array.from(item.turnos.entries()).sort((a, b) => {
+      const orden = { DIA: 1, TARDE: 2, NOCHE: 3, "SIN TURNO": 4 };
+      return (orden[a[0]] || 99) - (orden[b[0]] || 99);
+    })
+  })).sort((a, b) => b.valor - a.valor || b.registros - a.registros);
+  return `
+    <section class="rf-mobile-card rf-mobile-users">
+      <div class="rf-mobile-section-title">
+        <h3>${htmlSeguro(titulo)}</h3>
+        <strong>${fmt(usuarios.length)}</strong>
+      </div>
+      <div class="rf-mobile-user-list">
+        ${usuarios.map((u, index) => `
+          <article>
+            <em>${index + 1}</em>
+            <div>
+              <strong>${htmlSeguro(u.usuario)}</strong>
+              <small>${fmt(u.registros)} registros | ${pct(u.valor, total).toFixed(1)}%</small>
+              <span>${u.turnosDetalle.map(([turno, valor]) => `<b class="${turno.toLowerCase().replace(/\s/g, "-")}">${htmlSeguro(turno)} ${fmt(valor)}</b>`).join("")}</span>
+            </div>
+            <strong>${fmt(u.valor)}<small>${htmlSeguro(unidad)}</small></strong>
+          </article>
+        `).join("") || `<div class="empty-mini">Sin usuarios para este turno.</div>`}
+      </div>
+    </section>
+  `;
+}
+
+function proveedoresRecepcionMovil(proveedores, total) {
+  return `
+    <section class="rf-mobile-card rf-mobile-users">
+      <div class="rf-mobile-section-title">
+        <h3>Proveedores recepcion</h3>
+        <strong>${fmt(proveedores.length)}</strong>
+      </div>
+      <div class="rf-mobile-user-list">
+        ${proveedores.slice(0, 12).map((p, index) => `
+          <article>
+            <em>${index + 1}</em>
+            <div>
+              <strong>${htmlSeguro(p.proveedor)}</strong>
+              <small>${htmlSeguro(p.codigo)} | ASN ${fmt(p.asnUnicos)} | Pallets ${fmt(p.palletsTotal)}</small>
+              <span>
+                <b class="dia">Rec. ${fmt(p.recibido)}</b>
+                <b class="${p.diferencia ? "tarde" : "dia"}">Dif. ${fmt(p.diferencia)}</b>
+                <b>${p.cumplimiento.toFixed(1)}%</b>
+              </span>
+            </div>
+            <strong>${pct(p.recibido, total).toFixed(1)}%</strong>
+          </article>
+        `).join("") || `<div class="empty-mini">Sin proveedores seleccionados.</div>`}
+      </div>
+    </section>
+  `;
+}
+
+function palletsRecepcionReporte(data) {
+  const mapa = new Map();
+  data.forEach(r => {
+    const key = r.lpn || `SIN LPN ${r.index}`;
+    if (!mapa.has(key)) {
+      mapa.set(key, {
+        lpn: r.lpn || "SIN LPN",
+        codigoProveedor: r.codigoProveedor,
+        recibido: 0,
+        programado: 0,
+        codigos: new Set(),
+        asns: new Set()
+      });
+    }
+    const item = mapa.get(key);
+    item.recibido += r.recibido;
+    item.programado += r.programado;
+    if (r.codigo) item.codigos.add(r.codigo);
+    if (r.asn) item.asns.add(r.asn);
+  });
+  return Array.from(mapa.values()).map(item => ({
+    ...item,
+    tipo: item.codigos.size > 1 ? "MULTI" : "MONOPALLET",
+    totalCodigos: item.codigos.size,
+    totalAsn: item.asns.size
+  }));
+}
+
+function resumenRecepcionRf(data, proveedores) {
+  const pallets = palletsRecepcionReporte(data);
+  const data917 = data.filter(r => normalizar(r.codigoProveedor) === "917");
+  const pallets917 = pallets.filter(p => normalizar(p.codigoProveedor) === "917");
+  const totalProgramado = proveedores.reduce((acc, p) => acc + p.programado, 0);
+  const totalRecibido = proveedores.reduce((acc, p) => acc + p.recibido, 0);
+  return {
+    pallets,
+    totalProgramado,
+    totalRecibido,
+    diferencia: totalProgramado - totalRecibido,
+    cumplimiento: pctCumplimiento(totalRecibido, totalProgramado),
+    proveedores: proveedores.length,
+    asnUnicos: new Set(data.map(r => r.asn).filter(Boolean)).size,
+    palletsTotal: pallets.length,
+    paleterosRecibidos: new Set(data.map(r => r.asn).filter(asn => normalizar(asn).startsWith("OS917")).map(normalizar)).size,
+    recibido917: data917.reduce((acc, r) => acc + r.recibido, 0),
+    pallets917: pallets917.length,
+    mono917: pallets917.filter(p => p.tipo === "MONOPALLET").length,
+    multi917: pallets917.filter(p => p.tipo === "MULTI").length
+  };
+}
+
+function indicadoresRecepcionMovil(resumen) {
+  return `
+    <section class="rf-mobile-card">
+      <div class="rf-mobile-section-title">
+        <h3>Indicadores recepcion</h3>
+        <strong>${resumen.cumplimiento.toFixed(1)}%</strong>
+      </div>
+      <div class="rf-mobile-summary-grid">
+        <article><span>ASN</span><strong>${fmt(resumen.asnUnicos)}</strong></article>
+        <article><span>Pallets</span><strong>${fmt(resumen.palletsTotal)}</strong></article>
+        <article><span>Punta Negra</span><strong>${fmt(resumen.recibido917)}</strong></article>
+        <article><span>Mono 917</span><strong>${fmt(resumen.mono917)}</strong></article>
+        <article><span>Multi 917</span><strong>${fmt(resumen.multi917)}</strong></article>
+        <article><span>Diferencia</span><strong>${fmt(resumen.diferencia)}</strong></article>
+      </div>
+    </section>
+  `;
+}
+
+function turnoDespachoPorHoraRf(hora) {
+  if (hora === null || hora === undefined) return "SIN TURNO";
+  if (hora >= 7 && hora < 19) return "DIA";
+  if (hora >= 21 || hora < 7) return "NOCHE";
+  return "SIN TURNO";
+}
+
+function codigoKey(valor) {
+  return normalizar(valor).replace(/\s+/g, "").replace(/\.0+$/, "");
+}
+
+function cargaKey(valor) {
+  return normalizar(valor).replace(/[^A-Z0-9]/g, "").replace(/\.0+$/, "");
+}
+
+function catalogoProductosDespachoRf() {
+  const mapa = new Map();
+  (dataProductosReporte || []).forEach(row => {
+    const codigos = [
+      campo(row, ["Cod Barra", "Cod. Barra", "CodBarra", "COD BARRA", "COD. BARRA", "Codigo", "CODIGO", "Codigo Producto", "CODIGO PRODUCTO"]),
+      campo(row, ["CODIGO_ALT", "COD_ALT", "CODIGO ALTERNATIVO", "Cod Alternat", "Cod Altern", "COD ALTERN"])
+    ].map(codigoKey).filter(Boolean);
+    if (!codigos.length) return;
+    const producto = {
+      codigo: codigos[0],
+      descripcion: limpiar(campo(row, ["Descripcion", "DESCRIPCION", "Descrip Artic", "Descrip Artic", "Producto", "PRODUCTO"])),
+      undCaja: num(campo(row, ["Std Case Qty", "STD CASE QTY", "StdCaseQty", "STDCASEQTY", "Und x Caja", "UND X CAJA", "Und Caja", "UxC", "UNIDADES CAJA"])),
+      costoUnidad: num(campo(row, ["Costo Unidad", "Costo unidad", "Costo Unitario", "Costo", "Precio", "PRECIO"])),
+      jerarquia: limpiar(campo(row, ["Jerarq1", "JERARQ1", "Jerarquia", "JERARQUIA", "Familia", "FAMILIA"])) || "SIN JERARQUIA"
+    };
+    codigos.forEach(codigo => {
+      if (!mapa.has(codigo)) mapa.set(codigo, producto);
+    });
+  });
+  return mapa;
+}
+
+function capacidadCamionRf(paletas) {
+  const valor = num(paletas);
+  if (valor <= 0) return 0;
+  if (valor <= 5) return 6;
+  return [6, 8, 10, 12].reduce((mejor, actual) => {
+    const diffActual = Math.abs(valor - actual);
+    const diffMejor = Math.abs(valor - mejor);
+    return diffActual < diffMejor || (diffActual === diffMejor && actual > mejor) ? actual : mejor;
+  }, 6);
+}
+
+function cargasDespachoMapRf() {
+  const mapa = new Map();
+  (dataCargaReporte || []).forEach(row => {
+    const carga = limpiar(campo(row, ["Nro Carga", "NRO CARGA", "Carga", "CARGA", "Nro Ola", "OLA"]));
+    const key = cargaKey(carga);
+    if (!key || mapa.has(key)) return;
+    const fecha = fechaValor(campo(row, ["Fe Y Hr Modif", "Fe y Hr Modif", "FE Y HR MODIF", "Fecha de Envio", "Fecha Envio", "FECHA ENVIO", "Fecha"]));
+    const horaCarga = horaFecha(fecha);
+    const horaSeparada = horaValor(campo(row, ["Hora", "HORA", "Hora Envio", "HORA ENVIO", "Hr Modif", "HR MODIF", "Hora Carga", "HORA CARGA"]));
+    const paletas = num(campo(row, ["No-LPN Paletas", "NO-LPN PALETAS", "No LPN Paletas", "Nro Paletas", "Paletas", "PALETAS"]));
+    mapa.set(key, {
+      carga,
+      fecha,
+      hora: horaSeparada !== null && horaSeparada !== undefined ? horaSeparada : horaCarga,
+      placa: limpiar(campo(row, ["Nro Camion", "Nro CamiÃ³n", "NRO CAMION", "NRO CAMIÓN", "Placa", "PLACA"])),
+      paradas: num(campo(row, ["Paradas", "PARADAS", "Nro Paradas", "NRO PARADAS"])),
+      paletasDeclaradas: paletas,
+      capacidad: capacidadCamionRf(paletas)
+    });
+  });
+  return mapa;
+}
+
+function cargasDespachoListaRf(turno = "TODOS") {
+  const cargas = Array.from(cargasDespachoMapRf().values());
+  return turno === "TODOS" ? cargas : cargas.filter(carga => turnoDespachoPorHoraRf(carga.hora) === turno);
+}
+
+function viajesDespachoPorHoraRf(turno = "TODOS") {
+  const mapa = new Map();
+  cargasDespachoListaRf(turno).forEach(carga => {
+    if (carga.hora === null || carga.hora === undefined) return;
+    const key = String(carga.hora).padStart(2, "0");
+    if (!mapa.has(key)) mapa.set(key, { label: `${key}:00`, valor: 0, registros: 0 });
+    const item = mapa.get(key);
+    item.valor += 1;
+    item.registros += 1;
+  });
+  return Array.from(mapa.values()).sort((a, b) => Number(a.label.slice(0, 2)) - Number(b.label.slice(0, 2)));
+}
+
+function modeloDespachoReporte() {
+  const cargas = cargasDespachoMapRf();
+  const productos = catalogoProductosDespachoRf();
+  return (dataCartonesReporte || []).map((r, index) => {
+    const carga = limpiar(campo(r, ["Nro Carga", "NRO CARGA", "Carga", "CARGA", "Nro Ola", "OLA"]));
+    const cargaInfo = cargas.get(cargaKey(carga));
+    const fecha = cargaInfo?.fecha || fechaValor(campo(r, [
+      "Hora de asignación de carga",
+      "Hora de asignaciÃ³n de carga",
+      "LPN Fe Y Hr Modif",
+      "LPN Fe y Hr Modif",
+      "Fe Hr Packing",
+      "Fe Y Hr Modif",
+      "Fe y Hr Modif",
+      "FE Y HR MODIF",
+      "Fecha",
+      "FECHA"
+    ]));
+    const hora = horaFecha(fecha);
+    const productoCodigo = codigoKey(campo(r, ["Cod Barra", "Cod. Barra", "CodBarra", "COD BARRA", "COD. BARRA", "Codigo", "CODIGO", "Codigo Producto", "CODIGO PRODUCTO", "Producto", "PRODUCTO"]));
+    const producto = productos.get(productoCodigo);
+    const unidades = num(campo(r, ["UnAct", "UNACT", "Un Act", "UN ACT", "Unidades", "UNIDADES", "Un Rcb", "UN RCB"]));
+    const undCaja = producto?.undCaja || num(campo(r, ["Std Case Qty", "STD CASE QTY", "StdCaseQty", "STDCASEQTY", "Und x Caja", "UND X CAJA", "Und Caja", "UxC"]));
+    const bultos = undCaja > 0 ? unidades / undCaja : 0;
+    const costoUnidad = producto?.costoUnidad || 0;
+    const destino = limpiar(campo(r, ["Destino", "DESTINO", "Cod Destino", "COD DESTINO", "Tienda", "TIENDA"]));
+    const local = limpiar(campo(r, ["Nombre Destino", "NOMBRE DESTINO", "LOCAL", "TIENDA"])) || "SIN DESTINO";
+    return {
+      index,
+      pallet: limpiar(campo(r, ["Nro Pallet", "NroPallet", "NRO PALLET", "PALLET", "Pallet"])),
+      lpn: limpiar(campo(r, ["Nro LPNs", "Nro LPN", "NRO LPNS", "LPN"])),
+      producto: productoCodigo,
+      descripcion: producto?.descripcion || limpiar(campo(r, ["Descripcion", "DESCRIPCION", "Descrip Artic", "Descrip Artic"])),
+      unidades,
+      bultos,
+      costo: unidades * costoUnidad,
+      carga,
+      destino,
+      local,
+      destinoKey: destino ? `${destino} | ${local}` : local,
+      fecha,
+      hora,
+      turno: turnoDespachoPorHoraRf(hora),
+      placa: cargaInfo?.placa || "",
+      paradas: cargaInfo?.paradas || 0,
+      paletasDeclaradas: cargaInfo?.paletasDeclaradas || 0,
+      capacidadCamion: cargaInfo?.capacidad || 0
+    };
+  }).filter(r => r.pallet && r.carga && (r.bultos > 0 || r.unidades > 0));
+}
+
+function palletsDespachoRf(data) {
+  const mapa = new Map();
+  data.forEach(r => {
+    const key = `${normalizar(r.carga)}|${normalizar(r.pallet)}`;
+    if (!r.pallet || !key) return;
+    if (!mapa.has(key)) {
+      mapa.set(key, { pallet: r.pallet, bultos: 0, unidades: 0, costo: 0, productos: new Set(), destinos: new Set(), cargas: new Set() });
+    }
+    const item = mapa.get(key);
+    item.bultos += r.bultos;
+    item.unidades += r.unidades || 0;
+    item.costo += r.costo || 0;
+    if (r.producto) item.productos.add(r.producto);
+    if (r.destinoKey) item.destinos.add(r.destinoKey);
+    if (r.carga) item.cargas.add(r.carga);
+  });
+  return Array.from(mapa.values()).map(p => ({
+    ...p,
+    tipo: p.productos.size > 1 ? "MULTISKU" : "MONOPALLET",
+    totalProductos: p.productos.size,
+    totalDestinos: p.destinos.size
+  }));
+}
+
+function resumenDespachoRf(data, turnoFiltro = "TODOS") {
+  const cargasBase = cargasDespachoListaRf(turnoFiltro);
+  const cargasData = new Set(data.map(r => r.carga).filter(Boolean)).size;
+  const pallets = palletsDespachoRf(data);
+  const totalBultos = data.reduce((a, b) => a + b.bultos, 0);
+  const totalUnidades = data.reduce((a, b) => a + (b.unidades || 0), 0);
+  const costoTotal = data.reduce((a, b) => a + (b.costo || 0), 0);
+  const capacidadTotal = cargasBase.reduce((a, b) => a + (b.capacidad || 0), 0);
+  return {
+    pallets,
+    totalBultos,
+    totalUnidades,
+    costoTotal,
+    palletsTotal: pallets.length,
+    viajes: cargasBase.length || cargasData,
+    tiendas: new Set(data.map(r => r.destino).filter(Boolean)).size,
+    placas: new Set(cargasBase.map(r => r.placa).filter(Boolean)).size || new Set(data.map(r => r.placa).filter(Boolean)).size,
+    capacidadTotal,
+    ocupacion: pct(cargasBase.reduce((a, b) => a + (b.paletasDeclaradas || 0), 0), capacidadTotal),
+    bultosPallet: totalBultos / Math.max(pallets.length, 1),
+    mono: pallets.filter(p => p.tipo === "MONOPALLET").length,
+    multi: pallets.filter(p => p.tipo === "MULTISKU").length
+  };
+}
+
+function cargasDespachoMovil(data) {
+  const cargas = agruparSuma(data, r => r.carga, r => r.bultos).slice(0, 12);
+  const total = data.reduce((acc, row) => acc + row.bultos, 0);
+  return `
+    <section class="rf-mobile-card rf-mobile-users">
+      <div class="rf-mobile-section-title">
+        <h3>Cargas despacho</h3>
+        <strong>${fmt(cargas.length)}</strong>
+      </div>
+      <div class="rf-mobile-user-list">
+        ${cargas.map((carga, index) => `
+          <article>
+            <em>${index + 1}</em>
+            <div>
+              <strong>${htmlSeguro(carga.label)}</strong>
+              <small>${fmt(carga.registros)} registros | ${pct(carga.valor, total).toFixed(1)}%</small>
+            </div>
+            <strong>${fmt(carga.valor)}<small>bultos</small></strong>
+          </article>
+        `).join("") || `<div class="empty-mini">Sin cargas para este turno.</div>`}
+      </div>
+    </section>
+  `;
+}
+
+function turnosDespachoMovil(dataGeneral, resumenGeneral) {
+  const sinTurno = dataGeneral.filter(row => row.turno === "SIN TURNO");
+  const turnos = sinTurno.length === dataGeneral.length ? ["SIN TURNO"] : ["DIA", "NOCHE"];
+  return `
+    <section class="rf-mobile-card rf-mobile-users">
+      <div class="rf-mobile-section-title">
+        <h3>Resumen por turno</h3>
+        <strong>S/ ${fmt(resumenGeneral.costoTotal)}</strong>
+      </div>
+      <div class="rf-mobile-user-list">
+        ${turnos.map((turno, index) => {
+          const rows = dataGeneral.filter(row => row.turno === turno);
+          const resumen = resumenDespachoRf(rows, turno);
+          return `
+            <article>
+              <em>${index + 1}</em>
+              <div>
+                <strong>${turno}</strong>
+                <small>${fmt(resumen.viajes)} viajes | ${fmt(resumen.palletsTotal)} pallets | ${fmt(resumen.tiendas)} tiendas</small>
+                <span>
+                  <b class="${turno.toLowerCase()}">S/ ${fmt(resumen.costoTotal)}</b>
+                  <b>${fmt(resumen.bultosPallet)} b/pallet</b>
+                </span>
+              </div>
+              <strong>${pct(resumen.costoTotal, resumenGeneral.costoTotal).toFixed(1)}%</strong>
+            </article>
+          `;
+        }).join("")}
       </div>
     </section>
   `;
@@ -479,6 +1140,16 @@ function cambiarTurnoReporte(turno) {
   renderReportes();
 }
 
+function cambiarTurnoRecepcionRf(turno) {
+  turnoReporteRecepcion = turno;
+  renderReportes();
+}
+
+function cambiarTurnoDespachoRf(turno) {
+  turnoReporteDespacho = turno;
+  renderReportes();
+}
+
 function cambiarReporte(vista) {
   reporteActivo = vista;
   renderReportes();
@@ -500,6 +1171,15 @@ function mostrarApp() {
   document.getElementById("loginView").hidden = true;
   document.getElementById("appView").hidden = false;
   recargarDatos(false);
+}
+
+function actualizarVistaRf() {
+  if (!datosListos) return;
+  if (datosOperativosListos) registrarTareasTrabajoRemoto();
+  if (vistaRf === "validacion") renderValidacionPlusMovil();
+  else if (vistaRf === "asignacion") renderAsignacionOperacionalMovil();
+  else if (vistaRf === "trabajo") renderTrabajoAsignacionMovil();
+  else if (vistaRf === "reportes") renderReportes();
 }
 
 function mostrarLogin() {
@@ -531,6 +1211,9 @@ async function recargarDatos(forzar = true) {
   if (datosListos && !forzar) {
     estado(`${fmt(dataLPN.length)} LPNs | data lista`);
     if (vistaRf === "validacion") renderValidacionPlusMovil();
+    else if (vistaRf === "asignacion") renderAsignacionOperacionalMovil();
+    else if (vistaRf === "trabajo") renderTrabajoAsignacionMovil();
+    else if (vistaRf === "dashboard") renderDashboardTrabajo();
     else if (vistaRf === "reportes") renderReportes();
     else enfocarLpn();
     return;
@@ -541,9 +1224,12 @@ async function recargarDatos(forzar = true) {
     boton.textContent = "Leyendo...";
   }
   try {
-    await cargarDatos();
+    await cargarDatos({ esperarReportes: forzar });
     cacheValidacionPlus = null;
     if (vistaRf === "validacion") renderValidacionPlusMovil();
+    else if (vistaRf === "asignacion") renderAsignacionOperacionalMovil();
+    else if (vistaRf === "trabajo") renderTrabajoAsignacionMovil();
+    else if (vistaRf === "dashboard") renderDashboardTrabajo();
     else if (vistaRf === "reportes") renderReportes();
     else enfocarLpn();
   } catch (error) {
@@ -581,7 +1267,7 @@ function buscarConsulta(valor) {
   }
 
   limpiarSeleccionConsulta();
-  const rows = dataLPN.filter(row => normalizar(row.lpn) === q);
+  const rows = indiceLpn.get(q) || [];
   document.getElementById("lpnInput").value = "";
   ocultarSugerencias();
   if (rows.length) {
@@ -655,11 +1341,11 @@ function productoInfo(codigo, row = {}) {
 
 function buscarProductoPorCodigo(q) {
   const exacto = normalizar(q);
-  const producto = dataProductos.find(row =>
+  const producto = (indiceProducto.get(exacto) || dataProductos.find(row =>
     row.codigo === exacto ||
     normalizar(row.codigoAlt) === exacto ||
     normalizar(row.estilo) === exacto
-  ) || dataProductos.find(row => normalizar(row.estilo).includes(exacto) && exacto.length >= 3);
+  )) || dataProductos.find(row => normalizar(row.estilo).includes(exacto) && exacto.length >= 3);
   if (producto) {
     return {
       codigo: producto.codigo,
@@ -1048,6 +1734,7 @@ function codigoAltPedido(row) {
     "CODIGO ALTERNATIVO",
     "Codigo Alternativo",
     "Cod Alternat",
+    "Cod Altern",
     "Codigo alternativo"
   ]));
 }
@@ -1057,7 +1744,15 @@ function descripcionPedido(row) {
 }
 
 function bultosNoAsignadoPedido(row) {
-  return num(campoPedido(row, ["BULTOS_NO_ASIGNADO", "BULTO_NO_ASIGANDO", "BULTOS_NO_ASIGANDO"]));
+  return num(campoPedido(row, [
+    "BULTOS_NO_ASIGNADO",
+    "BULTOS_NO_ASIGNADOS",
+    "BULTO_NO_ASIGNADO",
+    "BULTO_NO_ASIGANDO",
+    "BULTOS_NO_ASIGANDO",
+    "NO_ASIGNADO",
+    "NO ASIGNADO"
+  ]));
 }
 
 function obtenerPedidoNoAsignadoRf() {
@@ -1084,6 +1779,29 @@ function obtenerPedidoNoAsignadoRf() {
   return Array.from(mapa.values());
 }
 
+function bultosPedidoTotalAsignacionRf(row) {
+  return num(campoPedido(row, ["BULTOS_PEDIDO", "BULTOS PEDIDO", "PEDIDO", "BULTOS"]));
+}
+
+function bultosAsignadosPedidoRf(row) {
+  return num(campoPedido(row, [
+    "BULTOS_ASIGNADOS",
+    "BULTOS_ASIGANDOS",
+    "BULTOS_ASIGNADO",
+    "BULTO_ASIGNADO",
+    "ASIGNADO"
+  ]));
+}
+
+function resumenPedidoAsignacionRf() {
+  return (dataPedido || []).reduce((acc, row) => {
+    acc.pedido += bultosPedidoTotalAsignacionRf(row);
+    acc.asignado += bultosAsignadosPedidoRf(row);
+    acc.noAsignado += bultosNoAsignadoPedido(row);
+    return acc;
+  }, { pedido: 0, asignado: 0, noAsignado: 0 });
+}
+
 function ubicacionTipoValidacion(ubicacion) {
   const u = normalizar(ubicacion);
   if (u.startsWith("MASS-")) return "reserva";
@@ -1098,8 +1816,7 @@ function pasilloReservaRf(ubicacion) {
 }
 
 function lpnsStockProducto(codigo) {
-  return dataLPN.filter(row =>
-    normalizar(row.codigo) === codigo &&
+  return (indiceLpnCodigo.get(codigo) || []).filter(row =>
     (normalizar(row.estado) === "UBICADO" || normalizar(row.estado) === "RECIBIDO")
   );
 }
@@ -1115,6 +1832,27 @@ function elegirStockRf(rows, requerido) {
     if (restante <= 0) break;
     const tomar = Math.min(restante, item.stock);
     usados.push({ ...item, tomar });
+    restante -= tomar;
+  }
+  return usados;
+}
+
+function elegirLpnsAsignacionRf(rows, requerido) {
+  const utiles = rows
+    .map(row => ({ row, stock: num(row.bultos) }))
+    .filter(x => x.stock > 0);
+  let bestFit = null;
+  for (const item of utiles) {
+    if (item.stock >= requerido && (!bestFit || item.stock < bestFit.stock)) bestFit = item;
+  }
+  if (bestFit) return [{ row: bestFit.row, tomar: requerido, stock: bestFit.stock, highlight: true }];
+  let restante = requerido;
+  const usados = [];
+  utiles.sort((a, b) => b.stock - a.stock);
+  for (const item of utiles) {
+    if (restante <= 0) break;
+    const tomar = Math.min(restante, item.stock);
+    usados.push({ row: item.row, tomar, stock: item.stock, highlight: false });
     restante -= tomar;
   }
   return usados;
@@ -1144,6 +1882,130 @@ function activosValidacionProducto(item, requerido) {
     bultos: x.stock,
     lpn: `ACTIVO ${x.row.ubicacion}`
   })), requerido);
+}
+
+function procesarAsignacionOperacionalRf() {
+  const pedido = obtenerPedidoNoAsignadoRf();
+  const tablaReserva = [];
+  const tablaOtras = [];
+  const sinStock = [];
+  const productos = [];
+
+  pedido.forEach(item => {
+    const stock = lpnsStockProducto(item.codigo);
+    const reserva = stock.filter(row => ubicacionTipoValidacion(row.ubicacion) === "reserva");
+    const otras = stock.filter(row => ubicacionTipoValidacion(row.ubicacion) === "otras");
+    const activos = activosValidacionProducto(item, item.total);
+    const stockActivo = activos.reduce((acc, row) => acc + num(row.stock), 0);
+    const stockReserva = reserva.reduce((acc, row) => acc + num(row.bultos), 0);
+    const stockOtras = otras.reduce((acc, row) => acc + num(row.bultos), 0);
+    let restante = item.total;
+    let asignadoActivo = 0;
+    let asignadoReserva = 0;
+    let asignadoOtras = 0;
+
+    activos.forEach(usado => {
+      const tomar = Math.min(restante, usado.tomar);
+      if (tomar <= 0) return;
+      asignadoActivo += tomar;
+      restante -= tomar;
+    });
+
+    const pedidoReserva = Math.min(restante, stockReserva);
+    elegirLpnsAsignacionRf(reserva, restante).forEach(usado => {
+      const tomar = Math.min(restante, usado.tomar);
+      if (tomar <= 0) return;
+      tablaReserva.push({
+        codigo: item.codigo,
+        codigoAlt: item.codigoAlt,
+        desc: item.descripcion,
+        lpn: usado.row.lpn,
+        ubicacion: usado.row.ubicacion,
+        requerido: pedidoReserva,
+        requerimientoTotal: item.total,
+        cs: usado.stock,
+        bultos: usado.stock,
+        asignar: tomar,
+        restante: usado.stock - tomar,
+        highlight: usado.highlight,
+        origen: "reserva",
+        grupo: pasilloReservaRf(usado.row.ubicacion) || "SIN"
+      });
+      asignadoReserva += tomar;
+      restante -= tomar;
+    });
+
+    const pedidoOtras = restante;
+    elegirLpnsAsignacionRf(otras, restante).forEach(usado => {
+      const tomar = Math.min(restante, usado.tomar);
+      if (tomar <= 0) return;
+      tablaOtras.push({
+        codigo: item.codigo,
+        codigoAlt: item.codigoAlt,
+        desc: item.descripcion,
+        lpn: usado.row.lpn,
+        ubicacion: usado.row.ubicacion || "SIN UBICACION",
+        requerido: pedidoOtras,
+        requerimientoTotal: item.total,
+        cs: usado.stock,
+        bultos: usado.stock,
+        asignar: tomar,
+        restante: usado.stock - tomar,
+        highlight: usado.highlight,
+        origen: "otras"
+      });
+      asignadoOtras += tomar;
+      restante -= tomar;
+    });
+
+    if (restante > 0) {
+      sinStock.push({
+        codigo: item.codigo,
+        codigoAlt: item.codigoAlt,
+        desc: item.descripcion,
+        bultos: restante,
+        estado: stockActivo + stockReserva + stockOtras > 0 ? "STOCK INSUFICIENTE" : "SIN STOCK"
+      });
+    }
+
+    productos.push({
+      ...item,
+      stockActivo,
+      stockReserva,
+      stockOtras,
+      asignadoActivo,
+      asignadoReserva,
+      asignadoOtras,
+      sinCobertura: Math.max(0, restante)
+    });
+  });
+
+  const resumenPedido = resumenPedidoAsignacionRf();
+  const resumen = productos.reduce((acc, row) => {
+    acc.requerido += row.total;
+    acc.activo += row.asignadoActivo;
+    acc.reserva += row.asignadoReserva;
+    acc.otras += row.asignadoOtras;
+    acc.sinCobertura += row.sinCobertura;
+    acc.productos += 1;
+    if (row.sinCobertura > 0) acc.productosSinCobertura += 1;
+    if (row.stockActivo + row.stockReserva + row.stockOtras <= 0) acc.productosSinStock += 1;
+    return acc;
+  }, { requerido: 0, activo: 0, reserva: 0, otras: 0, sinCobertura: 0, productos: 0, productosSinCobertura: 0, productosSinStock: 0 });
+  resumen.pedido = resumenPedido.pedido;
+  resumen.asignado = resumenPedido.asignado;
+  resumen.noAsignado = resumenPedido.noAsignado;
+  resumen.asignable = Math.max(0, resumenPedido.pedido - resumenPedido.asignado);
+  resumen.stockAsignable = resumen.activo + resumen.reserva + resumen.otras;
+  resumen.cobertura = resumen.noAsignado > 0 ? (resumen.stockAsignable / resumen.noAsignado) * 100 : 0;
+
+  return {
+    reserva: tablaReserva.sort((a, b) => String(a.ubicacion || "").localeCompare(String(b.ubicacion || ""), "es", { numeric: true })),
+    otras: tablaOtras.sort((a, b) => b.asignar - a.asignar),
+    sinStock: sinStock.sort((a, b) => b.bultos - a.bultos),
+    productos,
+    resumen
+  };
 }
 
 function agruparCodPlusRf() {
@@ -1343,6 +2205,10 @@ function renderValidacionPlusMovil() {
     mostrarMensaje("Data cargando", "Espera unos segundos y vuelve a abrir la validacion.");
     return;
   }
+  if (!datosOperativosListos) {
+    mostrarMensaje("Data operativa cargando", "LPNS ya esta lista. Espera a que termine PEDIDO, PRODUCTOS e INV_ACTIVO.");
+    return;
+  }
   const data = obtenerValidacionPlusRf().map((row, index) => ({ ...row, _index: index }));
   const resumen = resumenGrupoValidacionRf(data);
   const reserva = data.filter(row => row.origen === "RESERVA");
@@ -1373,6 +2239,456 @@ function renderValidacionPlusMovil() {
   `;
 }
 
+function resumenPasillosAsignacionRf(reserva) {
+  const mapa = new Map();
+  reserva.forEach(row => {
+    const pasillo = row.grupo || pasilloReservaRf(row.ubicacion) || "SIN";
+    if (!mapa.has(pasillo)) {
+      mapa.set(pasillo, { pasillo, bultos: 0, ubicaciones: new Set(), lpns: new Set(), lineas: 0 });
+    }
+    const item = mapa.get(pasillo);
+    item.bultos += row.asignar;
+    item.lineas += 1;
+    if (row.ubicacion) item.ubicaciones.add(row.ubicacion);
+    if (row.lpn) item.lpns.add(row.lpn);
+  });
+  return Array.from(mapa.values()).map(item => ({
+    ...item,
+    ubicacionesTotal: item.ubicaciones.size,
+    lpnsTotal: item.lpns.size
+  })).sort((a, b) => String(a.pasillo).localeCompare(String(b.pasillo), "es", { numeric: true }));
+}
+
+function claveAsignacionOperativa(row) {
+  return [row.origen, row.codigo, row.lpn, row.ubicacion, row.asignar].map(limpiar).join("|");
+}
+
+function estaCompletaAsignacion(row) {
+  return estadoAsignacionOperativa[claveAsignacionOperativa(row)] === "completo";
+}
+
+async function toggleAsignacionOperativa(key) {
+  if (!key || guardandoTrabajo.has(key)) return;
+  const anterior = estadoAsignacionOperativa[key] === "completo" ? "completo" : "pendiente";
+  const siguiente = anterior === "completo" ? "pendiente" : "completo";
+
+  if (apiTrabajoDisponible() && !operadorTrabajo) {
+    operadorTrabajo = limpiar(window.prompt("Nombre del operador:", "") || "");
+    if (!operadorTrabajo) return;
+    localStorage.setItem("rf_trabajo_operador", operadorTrabajo);
+  }
+
+  estadoAsignacionOperativa[key] = siguiente;
+  localStorage.setItem("rf_asignacion_operativa_estado", JSON.stringify(estadoAsignacionOperativa));
+  renderTrabajoAsignacionMovil();
+
+  if (!apiTrabajoDisponible()) return;
+  guardandoTrabajo.add(key);
+  try {
+    const fila = obtenerFilaTrabajoPorClave(key) || {};
+    const response = await fetch(urlApiTrabajo(), {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({
+        action: "ACTUALIZAR",
+        registro: {
+          clave: key,
+          estado: siguiente === "completo" ? "COMPLETO" : "PENDIENTE",
+          operador: operadorTrabajo,
+          origen: fila.origen,
+          codigo: fila.codigo,
+          ubicacion: fila.ubicacion,
+          lpn: fila.lpn,
+          bultos: fila.asignar
+        }
+      })
+    });
+    const data = await response.json();
+    if (!response.ok || data.ok === false) {
+      if (data.conflicto) estadoAsignacionOperativa[key] = "completo";
+      else estadoAsignacionOperativa[key] = anterior;
+      localStorage.setItem("rf_asignacion_operativa_estado", JSON.stringify(estadoAsignacionOperativa));
+      renderTrabajoAsignacionMovil();
+      window.alert(data.mensaje || "No se pudo guardar el avance.");
+    }
+  } catch (error) {
+    estadoAsignacionOperativa[key] = anterior;
+    localStorage.setItem("rf_asignacion_operativa_estado", JSON.stringify(estadoAsignacionOperativa));
+    renderTrabajoAsignacionMovil();
+    window.alert("No se pudo sincronizar el avance. Revisa la conexion e intenta nuevamente.");
+  } finally {
+    guardandoTrabajo.delete(key);
+  }
+}
+
+function obtenerFilaTrabajoPorClave(key) {
+  const data = procesarAsignacionOperacionalRf();
+  return [...data.reserva, ...data.otras].find(row => claveAsignacionOperativa(row) === key);
+}
+
+async function limpiarAvanceAsignacionOperativa() {
+  if (!window.confirm("Se eliminara todo el avance del dia. Esta accion no se puede deshacer. ¿Continuar?")) return;
+  if (apiTrabajoDisponible()) {
+    try {
+      const response = await fetch(urlApiTrabajo(), {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify({ action: "RESET" })
+      });
+      const result = await response.json();
+      if (!response.ok || result.ok === false) throw new Error(result.mensaje || "No se pudo reiniciar el avance.");
+    } catch (error) {
+      window.alert(error.message || "No se pudo reiniciar el avance remoto.");
+      return;
+    }
+  }
+  estadoAsignacionOperativa = {};
+  estadoTrabajoRemoto = {};
+  tareasTrabajoRegistradas = false;
+  localStorage.removeItem("rf_asignacion_operativa_estado");
+  renderTrabajoAsignacionMovil();
+}
+
+function cambiarFiltroTrabajoAsignacion(valor) {
+  filtroTrabajoAsignacion = limpiar(valor);
+  clearTimeout(timerFiltroTrabajoAsignacion);
+  timerFiltroTrabajoAsignacion = setTimeout(() => {
+    const data = procesarAsignacionOperacionalRf();
+    const reserva = filtrarTrabajoAsignacion(data.reserva);
+    const otras = filtrarTrabajoAsignacion(data.otras);
+    const trabajo = [...reserva, ...otras];
+    const progreso = document.getElementById("trabajoAsignacionProgreso");
+    const reservaBox = document.getElementById("trabajoAsignacionReserva");
+    const otrasBox = document.getElementById("trabajoAsignacionOtras");
+    if (progreso) progreso.innerHTML = progresoAsignacionMovil(trabajo, false);
+    if (reservaBox) reservaBox.innerHTML = detalleTrabajoAsignacionMovil("Reserva MASS", reserva, true, false, true);
+    if (otrasBox) otrasBox.innerHTML = detalleTrabajoAsignacionMovil("Otras ubicaciones", otras, false, false, false);
+  }, 90);
+}
+
+function filtrarTrabajoAsignacion(rows) {
+  const q = normalizar(filtroTrabajoAsignacion);
+  if (!q) return rows;
+  return rows.filter(row => [
+    row.origen,
+    row.grupo,
+    row.ubicacion,
+    row.lpn,
+    row.codigo,
+    row.codigoAlt,
+    row.desc
+  ].map(normalizar).some(texto => texto.includes(q)));
+}
+
+function avanceAsignacionOperativa(rows) {
+  return rows.reduce((acc, row) => {
+    const valor = num(row.asignar);
+    acc.total += valor;
+    acc.filas += 1;
+    if (estaCompletaAsignacion(row)) {
+      acc.completado += valor;
+      acc.completas += 1;
+    }
+    return acc;
+  }, { total: 0, completado: 0, filas: 0, completas: 0 });
+}
+
+function ordenarTrabajoAsignacion(rows) {
+  return rows.slice().sort((a, b) =>
+    String(a.ubicacion || "").localeCompare(String(b.ubicacion || ""), "es", { numeric: true }) ||
+    String(a.lpn || "").localeCompare(String(b.lpn || ""), "es", { numeric: true })
+  );
+}
+
+function pasilloTrabajoAsignacion(row) {
+  const grupo = Number(row.grupo);
+  if (Number.isInteger(grupo) && grupo >= 1 && grupo <= 12) return grupo;
+  const partes = limpiar(row.ubicacion).toUpperCase().split("-");
+  const pasillo = Number(partes[1]);
+  return Number.isInteger(pasillo) && pasillo >= 1 && pasillo <= 12 ? pasillo : null;
+}
+
+function bloquesReservaTrabajoAsignacion(rows) {
+  const grupos = new Map();
+  rows.forEach(row => {
+    const pasillo = pasilloTrabajoAsignacion(row);
+    const clave = pasillo === null ? "SIN" : String(pasillo);
+    if (!grupos.has(clave)) grupos.set(clave, []);
+    grupos.get(clave).push(row);
+  });
+  return Array.from(grupos.entries()).sort(([a], [b]) => {
+    if (a === "SIN") return 1;
+    if (b === "SIN") return -1;
+    return Number(a) - Number(b);
+  });
+}
+
+function pasillosAsignacionMovil(rows, totalReserva) {
+  const pasillos = resumenPasillosAsignacionRf(rows.filter(row => row.origen === "reserva"));
+  return `
+    <section class="rf-mobile-card assignment-aisles">
+      <div class="rf-mobile-section-title">
+        <h3>Reserva por pasillo</h3>
+        <strong>${fmt(pasillos.length)}</strong>
+      </div>
+      <div class="assignment-aisle-list">
+        ${pasillos.map(p => `
+          <article>
+            <div>
+              <strong>Pasillo ${htmlSeguro(p.pasillo)}</strong>
+              <span>${fmt(p.ubicacionesTotal)} ubic. | ${fmt(p.lpnsTotal)} LPNs | ${fmt(p.lineas)} lineas</span>
+            </div>
+            <b>${fmt(p.bultos)}</b>
+            <i><u style="width:${Math.min(100, pct(p.bultos, totalReserva))}%"></u></i>
+          </article>
+        `).join("") || `<div class="empty-mini">Sin reserva MASS para asignar.</div>`}
+      </div>
+    </section>
+  `;
+}
+
+function progresoAsignacionMovil(rows, envoltura = true) {
+  const avance = avanceAsignacionOperativa(rows);
+  const porcentaje = pct(avance.completado, avance.total);
+  const contenido = `
+    <div class="rf-mobile-section-title">
+      <h3>Avance operativo</h3>
+      <strong>${porcentaje.toFixed(1)}%</strong>
+    </div>
+    <div class="assignment-progress">
+      <div><i style="width:${Math.min(100, porcentaje)}%"></i></div>
+      <span>${fmt(avance.completado)} de ${fmt(avance.total)} bultos | ${fmt(avance.completas)} de ${fmt(avance.filas)} tareas</span>
+    </div>
+    <button type="button" class="assignment-reset" onclick="limpiarAvanceAsignacionOperativa()">Reiniciar avance</button>
+  `;
+  return envoltura ? `
+    <section class="rf-mobile-card assignment-progress-card">
+      ${contenido}
+    </section>
+  ` : contenido;
+}
+
+function tarjetaTrabajoAsignacion(row, index) {
+  const completa = estaCompletaAsignacion(row);
+  const key = atributoSeguro(claveAsignacionOperativa(row));
+  return `
+    <article class="${completa ? "done" : ""}">
+      <em>${index + 1}</em>
+      <div>
+        <strong>${htmlSeguro(row.ubicacion || "-")}</strong>
+        <small>${htmlSeguro(row.codigo)} | ${htmlSeguro(row.desc || "Sin descripcion")}</small>
+        <span>
+          <b class="${row.origen === "reserva" ? "dia" : "tarde"}">${row.origen === "reserva" ? "RESERVA" : "OTRAS"}</b>
+          <b>LPN ${htmlSeguro(row.lpn || "-")}</b>
+          <b>Stock ${fmt(row.bultos)}</b>
+        </span>
+      </div>
+      <div class="assignment-work-side">
+        <strong>${fmt(row.asignar)}<small>bultos</small></strong>
+        <button type="button" class="${completa ? "done" : ""}" data-assignment-key="${key}">${completa ? "Reabrir" : "Completar"}</button>
+      </div>
+    </article>
+  `;
+}
+
+function detalleTrabajoAsignacionMovil(titulo, rows, abierto = false, envoltura = true, segmentarPasillos = false) {
+  const ordenadas = ordenarTrabajoAsignacion(rows);
+  const avance = avanceAsignacionOperativa(ordenadas);
+  const lista = segmentarPasillos
+    ? bloquesReservaTrabajoAsignacion(ordenadas).map(([clave, grupo]) => {
+      const resumenGrupo = avanceAsignacionOperativa(grupo);
+      return `
+        <section class="assignment-aisle-group">
+          <div class="assignment-aisle-heading">
+            <strong>${clave === "SIN" ? "Sin pasillo" : `Pasillo ${clave}`}</strong>
+            <span>${fmt(resumenGrupo.completado)} / ${fmt(resumenGrupo.total)} bultos</span>
+          </div>
+          <div class="rf-mobile-user-list assignment-reserve-list">
+            ${grupo.map((row, index) => tarjetaTrabajoAsignacion(row, index)).join("")}
+          </div>
+        </section>
+      `;
+    }).join("")
+    : `<div class="rf-mobile-user-list assignment-reserve-list">
+        ${ordenadas.map((row, index) => tarjetaTrabajoAsignacion(row, index)).join("") || `<div class="empty-mini">Sin tareas para mostrar.</div>`}
+      </div>`;
+  const contenido = `
+    <summary>
+      <span>${htmlSeguro(titulo)}</span>
+      <strong>${fmt(avance.completado)} / ${fmt(avance.total)}</strong>
+    </summary>
+    <div class="rf-mobile-section-title">
+      <h3>${htmlSeguro(titulo)}</h3>
+      <strong>${pct(avance.completado, avance.total).toFixed(1)}%</strong>
+    </div>
+    ${lista || `<div class="empty-mini">Sin tareas para mostrar.</div>`}
+  `;
+  return envoltura ? `
+    <details class="rf-mobile-card rf-mobile-users assignment-work-block" ${abierto ? "open" : ""}>
+      ${contenido}
+    </details>
+  ` : contenido;
+}
+
+function renderAsignacionOperacionalMovil() {
+  if (!datosListos) {
+    mostrarMensaje("Data cargando", "Espera unos segundos y vuelve a abrir asignacion.");
+    return;
+  }
+  if (!datosOperativosListos) {
+    mostrarMensaje("Data operativa cargando", "LPNS ya esta lista. Espera a que termine la data de asignacion.");
+    return;
+  }
+  const data = procesarAsignacionOperacionalRf();
+  const reserva = data.reserva;
+  const otras = data.otras;
+  const resumen = data.resumen;
+  const ubicacionesReserva = new Set(reserva.map(row => row.ubicacion).filter(Boolean)).size;
+  const ubicacionesOtras = new Set(otras.map(row => row.ubicacion).filter(Boolean)).size;
+  const totalReserva = reserva.reduce((acc, row) => acc + row.asignar, 0);
+  const totalOtras = otras.reduce((acc, row) => acc + row.asignar, 0);
+  document.getElementById("resultado").innerHTML = `
+    <article class="result-card reports-module assignment-module">
+      <section class="rf-report-sheet assignment rf-mobile-picking rf-mobile-report">
+        <div class="rf-mobile-title green">
+          <span>Modulo RF</span>
+          <h2>Asignacion Operacional</h2>
+        </div>
+        <div class="rf-mobile-kpis">
+          ${kpiMovil("total", "Pedido total", fmt(resumen.pedido), "Bultos del pedido")}
+          ${kpiMovil("grafico", "No asignado", fmt(resumen.noAsignado), "Pendiente operacional")}
+          ${kpiMovil("cumplimiento", "Sin stock", fmt(resumen.sinCobertura), `${fmt(data.sinStock.length)} productos`)}
+          ${kpiMovil("pallet", "Ubic. reserva", fmt(ubicacionesReserva), `${fmt(totalReserva)} bultos MASS`)}
+          ${kpiMovil("tienda", "Otras ubic.", fmt(ubicacionesOtras), `${fmt(totalOtras)} bultos apoyo`)}
+        </div>
+        ${pastelMovil("Cobertura no asignado", [
+          { label: "Activo", valor: resumen.activo },
+          { label: "Reserva", valor: resumen.reserva },
+          { label: "Otras", valor: resumen.otras },
+          { label: "Sin stock", valor: resumen.sinCobertura }
+        ], Math.max(resumen.noAsignado, resumen.activo + resumen.reserva + resumen.otras + resumen.sinCobertura, 1), `${Math.min(100, resumen.cobertura).toFixed(1)}%`)}
+        ${pastelMovil("Solo reserva MASS", [
+          { label: "Reserva", valor: resumen.reserva },
+          { label: "No cubierto", valor: Math.max(0, resumen.noAsignado - resumen.reserva) }
+        ], Math.max(resumen.noAsignado, 1), "MASS")}
+        ${pastelMovil("Reserva vs otras", [
+          { label: "Reserva MASS", valor: resumen.reserva },
+          { label: "Otras ubicaciones", valor: resumen.otras }
+        ], Math.max(resumen.reserva + resumen.otras, 1), "Apoyo")}
+        ${pasillosAsignacionMovil(reserva, Math.max(totalReserva, 1))}
+      </section>
+    </article>
+  `;
+}
+
+function renderTrabajoAsignacionMovil() {
+  if (!datosListos) {
+    mostrarMensaje("Data cargando", "Espera unos segundos y vuelve a abrir trabajo.");
+    return;
+  }
+  if (!datosOperativosListos) {
+    mostrarMensaje("Data operativa cargando", "LPNS ya esta lista. Espera a que termine la data de asignacion.");
+    return;
+  }
+  iniciarSincronizacionTrabajo();
+  registrarTareasTrabajoRemoto();
+  const data = procesarAsignacionOperacionalRf();
+  const reservaBase = data.reserva;
+  const otrasBase = data.otras;
+  const reserva = filtrarTrabajoAsignacion(reservaBase);
+  const otras = filtrarTrabajoAsignacion(otrasBase);
+  const trabajo = [...reserva, ...otras];
+  const totalReserva = reservaBase.reduce((acc, row) => acc + row.asignar, 0);
+  document.getElementById("resultado").innerHTML = `
+    <article class="result-card reports-module assignment-module">
+      <section class="rf-report-sheet assignment rf-mobile-picking rf-mobile-report">
+        <div class="rf-mobile-title green">
+          <span>Operacion RF</span>
+          <h2>Trabajo No Asignado</h2>
+        </div>
+        <label class="rf-mobile-filter">Buscar por pasillo, ubicacion, LPN o codigo
+          <input value="${atributoSeguro(filtroTrabajoAsignacion)}" oninput="cambiarFiltroTrabajoAsignacion(this.value)" placeholder="Ej: 05, MASS-05, CT962, codigo">
+        </label>
+        <section id="trabajoAsignacionProgreso" class="rf-mobile-card assignment-progress-card">${progresoAsignacionMovil(trabajo, false)}</section>
+        ${pasillosAsignacionMovil(reservaBase, Math.max(totalReserva, 1))}
+        <details id="trabajoAsignacionReserva" class="rf-mobile-card rf-mobile-users assignment-work-block" open>${detalleTrabajoAsignacionMovil("Reserva MASS", reserva, true, false, true)}</details>
+        <details id="trabajoAsignacionOtras" class="rf-mobile-card rf-mobile-users assignment-work-block">${detalleTrabajoAsignacionMovil("Otras ubicaciones", otras, false, false, false)}</details>
+      </section>
+    </article>
+  `;
+}
+
+function pasilloDashboardTrabajo(ubicacion) {
+  const partes = limpiar(ubicacion).toUpperCase().split("-");
+  const pasillo = Number(partes[1]);
+  return Number.isInteger(pasillo) && pasillo >= 1 && pasillo <= 12 ? pasillo : null;
+}
+
+function renderDashboardTrabajo() {
+  if (!apiTrabajoDisponible()) {
+    mostrarMensaje("Dashboard no configurado", "Falta conectar la URL de Google Apps Script.");
+    return;
+  }
+  iniciarSincronizacionTrabajo();
+  const estados = Object.values(estadoTrabajoRemoto || {});
+  const total = estados.length;
+  const completos = estados.filter(row => normalizar(row.estado) === "COMPLETO");
+  const pendientes = Math.max(0, total - completos.length);
+  const bultosTotal = estados.reduce((acc, row) => acc + num(row.bultos), 0);
+  const bultosCompletos = completos.reduce((acc, row) => acc + num(row.bultos), 0);
+  const bultosPendientes = Math.max(0, bultosTotal - bultosCompletos);
+  const porcentaje = pct(bultosCompletos, bultosTotal);
+  const pasillos = new Map();
+  estados.forEach(row => {
+    const pasillo = pasilloDashboardTrabajo(row.ubicacion);
+    const clave = pasillo === null ? "OTRAS" : String(pasillo);
+    if (!pasillos.has(clave)) pasillos.set(clave, { total: 0, completos: 0, bultos: 0, bultosCompletos: 0 });
+    const item = pasillos.get(clave);
+    item.total += 1;
+    item.bultos += num(row.bultos);
+    if (normalizar(row.estado) === "COMPLETO") {
+      item.completos += 1;
+      item.bultosCompletos += num(row.bultos);
+    }
+  });
+  const pasillosOrdenados = Array.from(pasillos.entries()).sort(([a], [b]) => {
+    if (a === "OTRAS") return 1;
+    if (b === "OTRAS") return -1;
+    return Number(a) - Number(b);
+  });
+  document.getElementById("resultado").innerHTML = `
+    <article class="result-card reports-module work-dashboard-module">
+      <section class="rf-report-sheet rf-mobile-report work-dashboard">
+        <div class="rf-mobile-title green">
+          <span>Trabajo RF</span>
+          <h2>Dashboard de avance</h2>
+        </div>
+        <div class="rf-mobile-kpis work-dashboard-kpis">
+          ${kpiMovil("total", "Tareas", fmt(total), `${fmt(bultosTotal)} bultos`)}
+          ${kpiMovil("cumplimiento", "Completadas", fmt(completos.length), `${fmt(bultosCompletos)} bultos`)}
+          ${kpiMovil("grafico", "Pendientes", fmt(pendientes), `${fmt(bultosPendientes)} bultos`)}
+          ${kpiMovil("hora", "Avance", `${porcentaje.toFixed(1)}%`, "del dia")}
+        </div>
+        ${pastelMovil("Avance del dia", [
+          { label: "Completadas", valor: bultosCompletos },
+          { label: "Pendientes", valor: bultosPendientes }
+        ], Math.max(bultosTotal, 1), `${porcentaje.toFixed(1)}%`)}
+        <section class="rf-mobile-card work-dashboard-panel">
+          <div class="rf-mobile-section-title"><h3>Avance por pasillo</h3><strong>${fmt(pasillosOrdenados.length)}</strong></div>
+          <div class="work-dashboard-aisles">
+            ${pasillosOrdenados.map(([clave, item]) => `
+              <article>
+                <div><strong>${clave === "OTRAS" ? "Otras" : `P${clave}`}</strong><span>${fmt(item.bultosCompletos)} / ${fmt(item.bultos)} bultos</span></div>
+                <i><u style="width:${Math.min(100, pct(item.bultosCompletos, item.bultos))}%"></u></i>
+              </article>
+            `).join("") || `<div class="empty-mini">Sin avance registrado.</div>`}
+          </div>
+        </section>
+      </section>
+    </article>
+  `;
+}
+
 function renderReportePicking() {
   const dataGeneral = modeloPickingReporte();
   const data = turnoReportePicking === "TODOS" ? dataGeneral : dataGeneral.filter(r => r.turno === turnoReportePicking);
@@ -1392,9 +2708,9 @@ function renderReportePicking() {
         </select>
       </label>
       <div class="rf-mobile-kpis">
-        <article><span>Total bultos pickados</span><strong>${fmt(total)}</strong></article>
-        <article><span>Hora pico</span><strong>${htmlSeguro(horaPico?.label || "-")}</strong><small>${fmt(horaPico?.valor || 0)} bultos</small></article>
-        <article><span>Promedio x hora</span><strong>${fmt(promedioHora)}</strong><small>${fmt(horas.length)} horas activas</small></article>
+        ${kpiMovil("total", "Total bultos pickados", fmt(total))}
+        ${kpiMovil("hora", "Hora pico", htmlSeguro(horaPico?.label || "-"), `${fmt(horaPico?.valor || 0)} bultos`)}
+        ${kpiMovil("promedio", "Promedio x hora", fmt(promedioHora), `${fmt(horas.length)} horas activas`)}
       </div>
       ${tendenciaPickingMovil(horas, total)}
       ${detalleUsuariosPickingMovil(data, total)}
@@ -1428,46 +2744,95 @@ function filtroProveedoresReporte(proveedores) {
 }
 
 function renderReporteRecepcion() {
-  const data = modeloRecepcionReporte();
-  const proveedores = proveedoresResumenReporte(data);
+  const dataGeneral = modeloRecepcionReporte();
+  const dataTurno = turnoReporteRecepcion === "TODOS" ? dataGeneral : dataGeneral.filter(r => r.turno === turnoReporteRecepcion);
+  const proveedores = proveedoresResumenReporte(dataTurno);
   const visibles = proveedoresVisiblesReporte(proveedores);
   const claves = new Set(visibles.map(p => p.key));
-  const dataVisible = data.filter(row => claves.has(row.proveedorKey));
-  const totalRecibido = visibles.reduce((acc, p) => acc + p.recibido, 0);
-  const totalProgramado = visibles.reduce((acc, p) => acc + p.programado, 0);
-  const diferencia = totalProgramado - totalRecibido;
-  const paleteros = new Set(dataVisible.map(r => r.asn).filter(asn => normalizar(asn).startsWith("OS917")).map(normalizar)).size;
-  const pallets = new Set(dataVisible.map(r => r.lpn).filter(Boolean)).size;
-  const top = visibles.slice(0, 10);
+  const dataVisible = dataTurno.filter(row => claves.has(row.proveedorKey));
+  const resumen = resumenRecepcionRf(dataVisible, visibles);
   return `
-    <section class="rf-report-sheet reception">
-      <div class="rotate-hint">Gira el celular para ver el reporte horizontal completo.</div>
-      <div class="rf-report-hero green">
-        <div><span>Reporte Recepcion</span><h2>Proveedores</h2></div>
-        <article><span>Recibido</span><strong>${fmt(totalRecibido)}</strong></article>
-        <article><span>Programado</span><strong>${fmt(totalProgramado)}</strong></article>
-        <article><span>Diferencia</span><strong>${fmt(diferencia)}</strong></article>
-        <article><span>Cumplimiento</span><strong>${pctCumplimiento(totalRecibido, totalProgramado).toFixed(1)}%</strong></article>
+    <section class="rf-report-sheet reception rf-mobile-picking rf-mobile-report">
+      <div class="rf-mobile-title green">
+        <span>Modulo RF</span>
+        <h2>Reporte de Recepcion</h2>
       </div>
-      <div class="rf-report-highlights">
-        <article><span>Proveedores</span><strong>${fmt(visibles.length)}</strong><small>seleccionados</small></article>
-        <article><span>Paleteros</span><strong>${fmt(paleteros)}</strong><small>ASN OS917 unicos</small></article>
-        <article><span>Pallets</span><strong>${fmt(pallets)}</strong><small>LPN/pallet recepcionados</small></article>
+      <label class="rf-mobile-filter">Turno
+        <select onchange="cambiarTurnoRecepcionRf(this.value)">
+          ${["TODOS", "DIA", "TARDE", "NOCHE"].map(t => `<option value="${t}" ${turnoReporteRecepcion === t ? "selected" : ""}>${t}</option>`).join("")}
+        </select>
+      </label>
+      <div class="rf-mobile-kpis">
+        ${kpiMovil("recibido", "Recibido", fmt(resumen.totalRecibido), "Bultos recibidos")}
+        ${kpiMovil("total", "Programado", fmt(resumen.totalProgramado), "Bultos programados")}
+        ${kpiMovil("cumplimiento", "Cumplimiento", `${resumen.cumplimiento.toFixed(1)}%`, `Dif. ${fmt(resumen.diferencia)}`)}
+        ${kpiMovil("pallet", "Paleteros recibidos", fmt(resumen.paleterosRecibidos), "ASN OS917")}
+        ${kpiMovil("proveedor", "Proveedores", fmt(resumen.proveedores), "Seleccionados")}
       </div>
       ${filtroProveedoresReporte(proveedores)}
-      <div class="rf-report-grid reception-grid">
-        ${reporteDonutRecepcion(totalRecibido, diferencia, paleteros, visibles.length)}
-        <section class="rf-report-panel rf-provider-list">
-          <header><h3>PROVEEDORES</h3><strong>${fmt(visibles.length)}</strong></header>
-          ${top.map(p => `
-            <article class="${p.diferencia === 0 ? "ok" : p.diferencia > 0 ? "warn" : "bad"}">
-              <div><b>${htmlSeguro(corto(p.proveedor, 28))}</b><small>${htmlSeguro(p.codigo)} | ASN ${fmt(p.asnUnicos)} | Pallets ${fmt(p.palletsTotal)}</small></div>
-              <strong>${fmt(p.recibido)}</strong>
-              <span>${p.cumplimiento.toFixed(1)}% | Dif. ${fmt(p.diferencia)}</span>
-            </article>
-          `).join("") || `<div class="empty-mini">Sin proveedores seleccionados.</div>`}
-        </section>
+      ${pastelMovil("Cumplimiento recepcion", [
+        { label: "Recibido", valor: resumen.totalRecibido },
+        { label: "Pendiente", valor: Math.max(0, resumen.totalProgramado - resumen.totalRecibido) }
+      ], Math.max(resumen.totalProgramado, resumen.totalRecibido), `${resumen.cumplimiento.toFixed(1)}%`)}
+      ${pastelMovil("Mix Punta Negra 917", [
+        { label: "917 recibido", valor: resumen.recibido917 },
+        { label: "Otros proveedores", valor: Math.max(0, resumen.totalRecibido - resumen.recibido917) }
+      ], Math.max(resumen.totalRecibido, 1), "917")}
+      ${indicadoresRecepcionMovil(resumen)}
+      ${proveedoresRecepcionMovil(visibles, resumen.totalRecibido)}
+    </section>
+  `;
+}
+
+function renderReporteDespacho() {
+  const dataGeneral = modeloDespachoReporte();
+  const data = turnoReporteDespacho === "TODOS" ? dataGeneral : dataGeneral.filter(row => row.turno === turnoReporteDespacho);
+  const resumen = resumenDespachoRf(data, turnoReporteDespacho);
+  const resumenGeneral = resumenDespachoRf(dataGeneral, "TODOS");
+  const viajesHora = viajesDespachoPorHoraRf(turnoReporteDespacho);
+  const horaPico = viajesHora.slice().sort((a, b) => b.valor - a.valor)[0];
+  return `
+    <section class="rf-report-sheet dispatch rf-mobile-picking rf-mobile-report">
+      <div class="rf-mobile-title amber">
+        <span>Modulo RF</span>
+        <h2>Reporte de Despacho</h2>
       </div>
+      <label class="rf-mobile-filter">Turno
+        <select onchange="cambiarTurnoDespachoRf(this.value)">
+          ${["TODOS", "DIA", "NOCHE"].map(t => `<option value="${t}" ${turnoReporteDespacho === t ? "selected" : ""}>${t}</option>`).join("")}
+        </select>
+      </label>
+      <div class="rf-mobile-kpis">
+        ${kpiMovil("viaje", "Viajes", fmt(resumen.viajes), `Hora pico ${htmlSeguro(horaPico?.label || "-")} | ${fmt(horaPico?.valor || 0)} viajes`)}
+        ${kpiMovil("pallet", "Pallets", fmt(resumen.palletsTotal), `${fmt(resumen.mono)} mono | ${fmt(resumen.multi)} multisku`)}
+        ${kpiMovil("tienda", "Tiendas", fmt(resumen.tiendas), `${fmt(resumen.placas)} placas`)}
+        ${kpiMovil("costo", "Costo", `S/ ${fmt(resumen.costoTotal)}`, "Valorizado despacho")}
+        ${kpiMovil("grafico", "Bultos x pallet", fmt(resumen.bultosPallet), `${fmt(resumen.totalBultos)} bultos`)}
+      </div>
+      ${pastelMovil("Costo por turno", [
+        { label: "Dia", valor: resumenDespachoRf(dataGeneral.filter(row => row.turno === "DIA"), "DIA").costoTotal },
+        { label: "Noche", valor: resumenDespachoRf(dataGeneral.filter(row => row.turno === "NOCHE"), "NOCHE").costoTotal },
+        { label: "Sin turno", valor: resumenDespachoRf(dataGeneral.filter(row => row.turno === "SIN TURNO"), "TODOS").costoTotal }
+      ], Math.max(resumenGeneral.costoTotal, 1), "Costo")}
+      ${pastelMovil("Tipo de pallet", [
+        { label: "Monopallet", valor: resumen.mono },
+        { label: "Multisku", valor: resumen.multi }
+      ], Math.max(resumen.palletsTotal, 1), "Pallets")}
+      ${viajesHora.length ? tendenciaPickingMovil(viajesHora, Math.max(resumen.viajes, 1), "Viajes despacho por hora", "Sin viajes horarios de despacho.") : ""}
+      ${turnosDespachoMovil(dataGeneral, resumenGeneral)}
+      <section class="rf-mobile-card">
+        <div class="rf-mobile-section-title">
+          <h3>Resumen logistico</h3>
+          <strong>${fmt(resumen.viajes)}</strong>
+        </div>
+        <div class="rf-mobile-summary-grid">
+          <article><span>Capacidad</span><strong>${fmt(resumen.capacidadTotal)}</strong></article>
+          <article><span>Ocupacion</span><strong>${resumen.ocupacion.toFixed(1)}%</strong></article>
+          <article><span>Unidades</span><strong>${fmt(resumen.totalUnidades)}</strong></article>
+          <article><span>Bultos</span><strong>${fmt(resumen.totalBultos)}</strong></article>
+        </div>
+      </section>
+      ${cargasDespachoMovil(data)}
     </section>
   `;
 }
@@ -1475,6 +2840,18 @@ function renderReporteRecepcion() {
 function renderReportes() {
   if (!datosListos) {
     mostrarMensaje("Data cargando", "Espera unos segundos y vuelve a abrir reportes.");
+    return;
+  }
+  if (!reportesCargados) {
+    document.getElementById("resultado").innerHTML = `
+      <article class="result-card reports-module">
+        <div class="result-head"><span>Modulo RF</span><strong>Cargando reportes...</strong></div>
+        <div class="empty-state"><strong>Preparando informacion</strong><span>Los reportes se cargan solo al entrar a este modulo.</span></div>
+      </article>
+    `;
+    cargarReportes().then(() => {
+      if (vistaRf === "reportes") renderReportes();
+    });
     return;
   }
   document.getElementById("resultado").innerHTML = `
@@ -1486,9 +2863,10 @@ function renderReportes() {
       <div class="report-tabs">
         <button class="${reporteActivo === "picking" ? "active" : ""}" onclick="cambiarReporte('picking')">Picking</button>
         <button class="${reporteActivo === "recepcion" ? "active" : ""}" onclick="cambiarReporte('recepcion')">Recepcion</button>
+        <button class="${reporteActivo === "despacho" ? "active" : ""}" onclick="cambiarReporte('despacho')">Despacho</button>
       </div>
       <div class="report-scroll">
-        ${reporteActivo === "picking" ? renderReportePicking() : renderReporteRecepcion()}
+        ${reporteActivo === "picking" ? renderReportePicking() : reporteActivo === "recepcion" ? renderReporteRecepcion() : renderReporteDespacho()}
       </div>
     </article>
   `;
@@ -1547,14 +2925,27 @@ function verDetalleValidacionRf(index) {
 
 function cambiarVistaRf(vista) {
   vistaRf = vista;
+  if (vista !== "trabajo") detenerSincronizacionTrabajo();
   document.getElementById("appView")?.classList.toggle("report-mode", vista === "reportes");
   document.getElementById("tabConsulta").classList.toggle("active", vista === "consulta");
   document.getElementById("tabValidacion").classList.toggle("active", vista === "validacion");
+  document.getElementById("tabAsignacion").classList.toggle("active", vista === "asignacion");
+  document.getElementById("tabTrabajo").classList.toggle("active", vista === "trabajo");
+  document.getElementById("tabDashboard").classList.toggle("active", vista === "dashboard");
   document.getElementById("tabReportes").classList.toggle("active", vista === "reportes");
   document.querySelector(".scan-panel").hidden = vista !== "consulta";
   if (vista === "validacion") {
     detenerCamara();
     renderValidacionPlusMovil();
+  } else if (vista === "asignacion") {
+    detenerCamara();
+    renderAsignacionOperacionalMovil();
+  } else if (vista === "trabajo") {
+    detenerCamara();
+    renderTrabajoAsignacionMovil();
+  } else if (vista === "dashboard") {
+    detenerCamara();
+    renderDashboardTrabajo();
   } else if (vista === "reportes") {
     detenerCamara();
     renderReportes();
@@ -1737,6 +3128,11 @@ function atributoSeguro(valor) {
 }
 
 function manejarClickResultado(event) {
+  const asignacion = event.target.closest("[data-assignment-key]");
+  if (asignacion) {
+    toggleAsignacionOperativa(asignacion.dataset.assignmentKey || "");
+    return;
+  }
   const validacion = event.target.closest(".validation-item");
   if (validacion) {
     verDetalleValidacionRf(validacion.dataset.index);
@@ -1888,6 +3284,9 @@ document.getElementById("cameraButton").addEventListener("click", alternarCamara
 document.getElementById("resultado").addEventListener("click", manejarClickResultado);
 document.getElementById("tabConsulta").addEventListener("click", () => cambiarVistaRf("consulta"));
 document.getElementById("tabValidacion").addEventListener("click", () => cambiarVistaRf("validacion"));
+document.getElementById("tabAsignacion").addEventListener("click", () => cambiarVistaRf("asignacion"));
+document.getElementById("tabTrabajo").addEventListener("click", () => cambiarVistaRf("trabajo"));
+document.getElementById("tabDashboard").addEventListener("click", () => cambiarVistaRf("dashboard"));
 document.getElementById("tabReportes").addEventListener("click", () => cambiarVistaRf("reportes"));
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) detenerCamara();

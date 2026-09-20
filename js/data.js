@@ -1,4 +1,5 @@
 const SHEET_ID = "1-v6vXjHpLlIn0-_lVZw0BtGopnxSHH0zqoOrW8aBwcg";
+const TRABAJO_SHEET_ID = "1GY4EfroTQYqidPML5xj4qShkInKEnjWwJ7zSFGJEWsE";
 const BI_SHEET_ID = "1fMEnjNjCZf0c-9VPmeHOQnFERXy5jz7XJ2lY64tblRc";
 const RECEPCION_PROVEEDORES_SHEET_ID = "18iiFahjssG-2Or8HE9KjBer3DcuG0mDaMpxZj-rqycI";
 
@@ -11,7 +12,20 @@ let dataBloqueo = [];
 let dataPickingReporte = [];
 let dataRecepcionReporte = [];
 let dataRecepcionProveedoresResumen = [];
+let dataCargaReporte = [];
+let dataCartonesReporte = [];
+let dataProductosReporte = [];
 let datosListos = false;
+let datosOperativosListos = false;
+let cargandoDatosOperativos = null;
+let reportesCargados = false;
+let cargandoReportes = null;
+let indiceLpn = new Map();
+let indiceLpnCodigo = new Map();
+let indiceProducto = new Map();
+let fallosCarga = new Set();
+let generacionCargaRf = 0;
+const TIEMPO_MAXIMO_FETCH_MS = 20000;
 
 function limpiar(valor) {
   if (valor === null || valor === undefined) return "";
@@ -51,23 +65,118 @@ function campo(row, nombres) {
 }
 
 async function cargarHoja(nombre) {
+  const errores = [];
   const url = `https://opensheet.elk.sh/${SHEET_ID}/${encodeURIComponent(nombre)}`;
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText || ""}`.trim());
-  return await res.json();
+  try {
+    const res = await fetchConTiempo(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText || ""}`.trim());
+    return await res.json();
+  } catch (error) {
+    errores.push(`OpenSheet: ${error.message || error}`);
+  }
+
+  try {
+    return await cargarHojaCsv(SHEET_ID, nombre);
+  } catch (error) {
+    errores.push(`Google CSV: ${error.message || error}`);
+  }
+
+  throw new Error(`No se pudo cargar ${nombre}. ${errores.join(" | ")}`);
 }
 
 async function cargarHojaDesde(sheetId, nombre) {
+  const errores = [];
   const url = `https://opensheet.elk.sh/${sheetId}/${encodeURIComponent(nombre)}`;
-  const res = await fetch(url, { cache: "no-store" });
+  try {
+    const res = await fetchConTiempo(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText || ""}`.trim());
+    return await res.json();
+  } catch (error) {
+    errores.push(`OpenSheet: ${error.message || error}`);
+  }
+
+  try {
+    return await cargarHojaCsv(sheetId, nombre);
+  } catch (error) {
+    errores.push(`Google CSV: ${error.message || error}`);
+  }
+
+  throw new Error(`No se pudo cargar ${nombre}. ${errores.join(" | ")}`);
+}
+
+function detectarSeparadorCsv(texto) {
+  const primera = String(texto || "").split(/\r?\n/)[0] || "";
+  return (primera.match(/;/g) || []).length > (primera.match(/,/g) || []).length ? ";" : ",";
+}
+
+function parseCsv(texto, separador = ",") {
+  const rows = [];
+  let row = [];
+  let value = "";
+  let quoted = false;
+  for (let i = 0; i < texto.length; i += 1) {
+    const char = texto[i];
+    const next = texto[i + 1];
+    if (char === '"' && quoted && next === '"') {
+      value += '"';
+      i += 1;
+    } else if (char === '"') {
+      quoted = !quoted;
+    } else if (char === separador && !quoted) {
+      row.push(value);
+      value = "";
+    } else if ((char === "\n" || char === "\r") && !quoted) {
+      if (char === "\r" && next === "\n") i += 1;
+      row.push(value);
+      if (row.some(c => c !== "")) rows.push(row);
+      row = [];
+      value = "";
+    } else {
+      value += char;
+    }
+  }
+  row.push(value);
+  if (row.some(c => c !== "")) rows.push(row);
+  return rows;
+}
+
+function csvAObjetos(csv) {
+  const rows = parseCsv(csv, detectarSeparadorCsv(csv));
+  const headers = (rows.shift() || []).map(h => h.trim());
+  return rows.map(row => {
+    const obj = {};
+    headers.forEach((h, i) => {
+      obj[h] = row[i] ?? "";
+    });
+    return obj;
+  });
+}
+
+async function cargarHojaCsv(sheetId, nombre) {
+  const url = `https://docs.google.com/spreadsheets/d/${sheetId}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(nombre)}`;
+  const res = await fetchConTiempo(url);
   if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText || ""}`.trim());
-  return await res.json();
+  const csv = await res.text();
+  const data = csvAObjetos(csv);
+  if (!data.length) throw new Error("CSV sin filas");
+  return data;
+}
+
+async function fetchConTiempo(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIEMPO_MAXIMO_FETCH_MS);
+  try {
+    return await fetch(url, { cache: "no-store", signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function cargarOpcional(nombre) {
   try {
     return await cargarHoja(nombre);
   } catch (error) {
+    fallosCarga.add(nombre);
     console.warn(`No se pudo cargar ${nombre}:`, error.message || error);
     return [];
   }
@@ -77,6 +186,7 @@ async function cargarOpcionalDesde(sheetId, nombre) {
   try {
     return await cargarHojaDesde(sheetId, nombre);
   } catch (error) {
+    fallosCarga.add(`${sheetId}:${nombre}`);
     console.warn(`No se pudo cargar ${nombre}:`, error.message || error);
     return [];
   }
@@ -158,34 +268,105 @@ function normalizarFilaInventario(row) {
 
 function productoPorCodigo(codigo) {
   const key = normalizar(codigo);
-  return dataProductos.find(row => row.codigo === key);
+  return indiceProducto.get(key) || null;
 }
 
-async function cargarDatos() {
-  datosListos = false;
-  estado("Cargando data RF...");
-  const [lpns, pedido, productos, inventario, ubicaciones, bloqueo] = await Promise.all([
-    cargarHoja("LPNS"),
+function construirIndicesRf() {
+  indiceLpn = new Map();
+  indiceLpnCodigo = new Map();
+  dataLPN.forEach(row => {
+    const lpn = normalizar(row.lpn);
+    const codigo = normalizar(row.codigo);
+    if (lpn) {
+      const filasLpn = indiceLpn.get(lpn);
+      if (filasLpn) filasLpn.push(row);
+      else indiceLpn.set(lpn, [row]);
+    }
+    if (codigo) {
+      const filasCodigo = indiceLpnCodigo.get(codigo);
+      if (filasCodigo) filasCodigo.push(row);
+      else indiceLpnCodigo.set(codigo, [row]);
+    }
+  });
+  indiceProducto = new Map(dataProductos.map(row => [row.codigo, row]));
+}
+
+async function cargarReportes(generacion = generacionCargaRf) {
+  if (reportesCargados) return;
+  if (cargandoReportes) return cargandoReportes;
+  cargandoReportes = Promise.all([
+    cargarOpcionalDesde(BI_SHEET_ID, "PICKING"),
+    cargarOpcionalDesde(BI_SHEET_ID, "RECEPCION"),
+    cargarOpcionalDesde(RECEPCION_PROVEEDORES_SHEET_ID, "RESUMEN"),
+    cargarOpcionalDesde(BI_SHEET_ID, "CARGA"),
+    cargarOpcionalDesde(BI_SHEET_ID, "CARTONES"),
+    cargarOpcionalDesde(BI_SHEET_ID, "PRODUCTOS")
+  ]).then(([pickingReporte, recepcionReporte, proveedoresResumen, cargaReporte, cartonesReporte, productosReporte]) => {
+    if (generacion !== generacionCargaRf) return;
+    dataPickingReporte = pickingReporte;
+    dataRecepcionReporte = recepcionReporte;
+    dataRecepcionProveedoresResumen = proveedoresResumen;
+    dataCargaReporte = cargaReporte;
+    dataCartonesReporte = cartonesReporte;
+    dataProductosReporte = productosReporte;
+    reportesCargados = true;
+    estado(`${fmt(dataLPN.length)} LPNs | PICK ${fmt(dataPickingReporte.length)} | REC ${fmt(dataRecepcionReporte.length)} | DESP ${fmt(dataCartonesReporte.length)}`);
+  }).finally(() => {
+    if (generacion === generacionCargaRf) cargandoReportes = null;
+  });
+  return cargandoReportes;
+}
+
+async function cargarDatosOperativos(generacion = generacionCargaRf) {
+  if (datosOperativosListos) return;
+  if (cargandoDatosOperativos) return cargandoDatosOperativos;
+  estado("LPNS lista | cargando data operativa...");
+  cargandoDatosOperativos = Promise.all([
     cargarOpcional("PEDIDO"),
     cargarOpcional("PRODUCTOS"),
     cargarOpcional("INV_ACTIVO"),
     cargarOpcional("UBICACION"),
     cargarOpcional("BLOQUEO")
-  ]);
-  dataProductos = productos.map(normalizarFilaProducto).filter(row => row.codigo);
-  dataPedido = pedido;
+  ]).then(([pedido, productos, inventario, ubicaciones, bloqueo]) => {
+    if (generacion !== generacionCargaRf) return;
+    dataProductos = productos.map(normalizarFilaProducto).filter(row => row.codigo);
+    indiceProducto = new Map(dataProductos.map(row => [row.codigo, row]));
+    dataPedido = pedido;
+    dataInventario = inventario.map(normalizarFilaInventario).filter(row => row.codigo);
+    dataUbicaciones = ubicaciones;
+    dataBloqueo = bloqueo;
+    const fallosCriticos = ["PEDIDO", "PRODUCTOS", "INV_ACTIVO"].filter(nombre => fallosCarga.has(nombre));
+    datosOperativosListos = fallosCriticos.length === 0;
+    estado(datosOperativosListos
+      ? `${fmt(dataLPN.length)} LPNs | data operativa lista`
+      : `${fmt(dataLPN.length)} LPNs | revisar: ${fallosCriticos.join(", ")}`);
+    if (typeof actualizarVistaRf === "function") actualizarVistaRf();
+  }).catch(error => {
+    console.warn("No se pudo completar la data operativa:", error.message || error);
+    estado(`${fmt(dataLPN.length)} LPNs | data operativa con incidencias`);
+  }).finally(() => {
+    if (generacion === generacionCargaRf) cargandoDatosOperativos = null;
+  });
+  return cargandoDatosOperativos;
+}
+
+async function cargarDatos(opciones = {}) {
+  const esperarReportes = opciones.esperarReportes === true;
+  const generacion = ++generacionCargaRf;
+  datosListos = false;
+  datosOperativosListos = false;
+  cargandoDatosOperativos = null;
+  reportesCargados = false;
+  cargandoReportes = null;
+  fallosCarga = new Set();
+  estado("Cargando data RF...");
+  const lpns = await cargarHoja("LPNS");
   dataLPN = lpns.map(normalizarFilaLpn).filter(row => row.lpn);
-  dataInventario = inventario.map(normalizarFilaInventario).filter(row => row.codigo);
-  dataUbicaciones = ubicaciones;
-  dataBloqueo = bloqueo;
-  const [pickingReporte, recepcionReporte, proveedoresResumen] = await Promise.all([
-    cargarOpcionalDesde(BI_SHEET_ID, "PICKING"),
-    cargarOpcionalDesde(BI_SHEET_ID, "RECEPCION"),
-    cargarOpcionalDesde(RECEPCION_PROVEEDORES_SHEET_ID, "RESUMEN")
-  ]);
-  dataPickingReporte = pickingReporte;
-  dataRecepcionReporte = recepcionReporte;
-  dataRecepcionProveedoresResumen = proveedoresResumen;
+  construirIndicesRf();
   datosListos = true;
-  estado(`${fmt(dataLPN.length)} LPNs | PICK ${fmt(dataPickingReporte.length)} | REC ${fmt(dataRecepcionReporte.length)}`);
+  const operativa = cargarDatosOperativos(generacion);
+  if (esperarReportes) {
+    await operativa;
+    await cargarReportes(generacion);
+  }
 }
