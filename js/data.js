@@ -15,6 +15,7 @@ let dataRecepcionProveedoresResumen = [];
 let dataCargaReporte = [];
 let dataCartonesReporte = [];
 let dataProductosReporte = [];
+let dataUsuariosReporte = [];
 let datosListos = false;
 let datosOperativosListos = false;
 let cargandoDatosOperativos = null;
@@ -300,8 +301,9 @@ async function cargarReportes(generacion = generacionCargaRf) {
     cargarOpcionalDesde(RECEPCION_PROVEEDORES_SHEET_ID, "RESUMEN"),
     cargarOpcionalDesde(BI_SHEET_ID, "CARGA"),
     cargarOpcionalDesde(BI_SHEET_ID, "CARTONES"),
-    cargarOpcionalDesde(BI_SHEET_ID, "PRODUCTOS")
-  ]).then(([pickingReporte, recepcionReporte, proveedoresResumen, cargaReporte, cartonesReporte, productosReporte]) => {
+    cargarOpcionalDesde(BI_SHEET_ID, "PRODUCTOS"),
+    cargarOpcionalDesde(BI_SHEET_ID, "USUARIO")
+  ]).then(([pickingReporte, recepcionReporte, proveedoresResumen, cargaReporte, cartonesReporte, productosReporte, usuariosReporte]) => {
     if (generacion !== generacionCargaRf) return;
     dataPickingReporte = pickingReporte;
     dataRecepcionReporte = recepcionReporte;
@@ -309,8 +311,9 @@ async function cargarReportes(generacion = generacionCargaRf) {
     dataCargaReporte = cargaReporte;
     dataCartonesReporte = cartonesReporte;
     dataProductosReporte = productosReporte;
+    dataUsuariosReporte = usuariosReporte;
     reportesCargados = true;
-    estado(`${fmt(dataLPN.length)} LPNs | PICK ${fmt(dataPickingReporte.length)} | REC ${fmt(dataRecepcionReporte.length)} | DESP ${fmt(dataCartonesReporte.length)}`);
+    estado(`${fmt(dataLPN.length)} LPNs | PICK ${fmt(dataPickingReporte.length)} | USU ${fmt(dataUsuariosReporte.length)} | REC ${fmt(dataRecepcionReporte.length)} | DESP ${fmt(dataCartonesReporte.length)}`);
   }).finally(() => {
     if (generacion === generacionCargaRf) cargandoReportes = null;
   });
@@ -351,7 +354,6 @@ async function cargarDatosOperativos(generacion = generacionCargaRf) {
 }
 
 async function cargarDatos(opciones = {}) {
-  const esperarReportes = opciones.esperarReportes === true;
   const generacion = ++generacionCargaRf;
   datosListos = false;
   datosOperativosListos = false;
@@ -364,9 +366,5 @@ async function cargarDatos(opciones = {}) {
   dataLPN = lpns.map(normalizarFilaLpn).filter(row => row.lpn);
   construirIndicesRf();
   datosListos = true;
-  const operativa = cargarDatosOperativos(generacion);
-  if (esperarReportes) {
-    await operativa;
-    await cargarReportes(generacion);
-  }
+  cargarDatosOperativos(generacion);
 }

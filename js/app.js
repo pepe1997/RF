@@ -28,6 +28,42 @@ let guardandoTrabajo = new Set();
 let operadorTrabajo = localStorage.getItem("rf_trabajo_operador") || "";
 let estadoTrabajoRemoto = {};
 let tareasTrabajoRegistradas = false;
+let cacheUsuariosReportePorDni = { firma: "", mapa: new Map() };
+let fechaPedidoKpiAsignacion = "";
+
+function clavesUsuarioDniReporte(valor) {
+  const texto = limpiar(valor);
+  if (!texto) return [];
+  const exacta = normalizar(texto);
+  const sinDecimalCero = texto.replace(/[,.]0+$/, "");
+  const digitos = sinDecimalCero.replace(/\D/g, "");
+  return Array.from(new Set([exacta, digitos].filter(Boolean)));
+}
+
+function mapaUsuariosReportePorDni() {
+  const data = Array.isArray(dataUsuariosReporte) ? dataUsuariosReporte : [];
+  const firma = `${data.length}|${data[0] ? Object.keys(data[0]).join(",") : ""}|${limpiar(campo(data[0] || {}, ["DNI"]))}|${limpiar(campo(data[data.length - 1] || {}, ["DNI"]))}`;
+  if (cacheUsuariosReportePorDni.firma === firma) return cacheUsuariosReportePorDni.mapa;
+  const mapa = new Map();
+  data.forEach(row => {
+    const claves = clavesUsuarioDniReporte(campo(row, ["DNI", "Documento", "DOCUMENTO", "Codigo", "CODIGO"]));
+    const nombre = limpiar(campo(row, ["Nombre", "NOMBRE", "Nombres", "NOMBRES"]));
+    if (nombre) claves.forEach(clave => mapa.set(clave, nombre));
+  });
+  cacheUsuariosReportePorDni = { firma, mapa };
+  return mapa;
+}
+
+function nombreUsuarioReporte(usuario) {
+  const codigo = limpiar(usuario);
+  if (!codigo) return "";
+  const mapa = mapaUsuariosReportePorDni();
+  for (const clave of clavesUsuarioDniReporte(codigo)) {
+    const nombre = mapa.get(clave);
+    if (nombre) return nombre;
+  }
+  return codigo;
+}
 
 function urlApiTrabajo() {
   const guardada = String(localStorage.getItem(TRABAJO_API_STORAGE_KEY) || "").trim();
@@ -279,11 +315,7 @@ function descripcionNoCuentaReporte(descripcion) {
 }
 
 function reportePickingValido(row) {
-  const tipo = normalizar(row.tipo).replace(/[^A-Z0-9]/g, "");
-  if (tipo === "FULLCONTAINER") return false;
-  if (normalizar(row.lpn).startsWith("ILE")) return false;
-  if (descripcionNoCuentaReporte(row.descripcion)) return false;
-  return true;
+  return Number.isFinite(row.bultos) && row.bultos > 0;
 }
 
 function modeloPickingReporte() {
@@ -434,6 +466,7 @@ function usuariosPickingReporte(data) {
   });
   return Array.from(mapa.values()).map(item => ({
     ...item,
+    nombre: nombreUsuarioReporte(item.usuario),
     lpnsTotal: item.lpns.size,
     turnosDetalle: Array.from(item.turnos.entries()).sort((a, b) => {
       const orden = { DIA: 1, TARDE: 2, NOCHE: 3, "SIN TURNO": 4 };
@@ -444,53 +477,35 @@ function usuariosPickingReporte(data) {
 
 function tendenciaPickingMovil(data, total, titulo = "Tendencia picking", etiquetaVacia = "Sin datos horarios para este turno.") {
   if (!data.length) return `<section class="rf-mobile-card"><div class="empty-mini">${htmlSeguro(etiquetaVacia)}</div></section>`;
-  const width = 420;
-  const height = 285;
-  const left = 34;
-  const right = 28;
-  const top = 58;
-  const bottom = 64;
-  const plotW = width - left - right;
-  const plotH = height - top - bottom;
   const max = Math.max(...data.map(x => x.valor), 1);
-  const points = data.map((item, index) => ({
-    ...item,
-    x: data.length === 1 ? left + plotW / 2 : left + (plotW * index / (data.length - 1)),
-    y: top + plotH - (item.valor / max) * plotH
-  }));
-  const path = points.reduce((d, p, index) => {
-    if (index === 0) return `M ${p.x} ${p.y}`;
-    const prev = points[index - 1];
-    const mid = (prev.x + p.x) / 2;
-    return `${d} C ${mid} ${prev.y}, ${mid} ${p.y}, ${p.x} ${p.y}`;
-  }, "");
-  const pico = points.slice().sort((a, b) => b.valor - a.valor)[0];
+  const pico = data.slice().sort((a, b) => b.valor - a.valor)[0];
+  const promedio = data.length ? total / data.length : 0;
   return `
-    <section class="rf-mobile-card rf-mobile-trend">
+    <section class="rf-mobile-card rf-hour-report">
       <div class="rf-mobile-section-title">
         <h3>${htmlSeguro(titulo)}</h3>
         <strong>${fmt(total)}</strong>
       </div>
-      <svg viewBox="0 0 ${width} ${height}" aria-label="Tendencia de bultos por hora">
-        <g class="mobile-grid">
-          <line x1="${left}" y1="${top}" x2="${width - right}" y2="${top}"></line>
-          <line x1="${left}" y1="${top + plotH / 2}" x2="${width - right}" y2="${top + plotH / 2}"></line>
-          <line x1="${left}" y1="${top + plotH}" x2="${width - right}" y2="${top + plotH}"></line>
-        </g>
-        <path d="${path}"></path>
-        ${points.map(p => `
-          <g class="${p === pico ? "peak" : ""}">
-            ${p === pico ? `
-              <rect x="${p.x - 38}" y="${Math.max(8, p.y - 47)}" width="76" height="28" rx="8"></rect>
-              <text x="${p.x}" y="${Math.max(8, p.y - 47) + 19}" text-anchor="middle">${fmt(p.valor)}</text>
-            ` : ""}
-            <circle cx="${p.x}" cy="${p.y}" r="6"></circle>
-            <text class="hour" x="${p.x}" y="${height - 15}" text-anchor="middle">${htmlSeguro(p.label)}</text>
-          </g>
+      <div class="rf-hour-summary">
+        <article>
+          <span>Pico</span>
+          <strong>${htmlSeguro(pico.label)}</strong>
+          <b>${fmt(pico.valor)}</b>
+        </article>
+        <article>
+          <span>Promedio</span>
+          <strong>${fmt(promedio)}</strong>
+          <b>${fmt(data.length)} horas</b>
+        </article>
+      </div>
+      <div class="rf-hour-bars">
+        ${data.map(item => `
+          <article class="${item === pico ? "peak" : ""}">
+            <span>${htmlSeguro(item.label)}</span>
+            <div><i style="width:${Math.max(4, pct(item.valor, max))}%"></i></div>
+            <strong>${fmt(item.valor)}</strong>
+          </article>
         `).join("")}
-      </svg>
-      <div class="rf-mobile-hour-chips">
-        ${points.map(p => `<span class="${p === pico ? "peak" : ""}"><b>${htmlSeguro(p.label)}</b><strong>${fmt(p.valor)}</strong></span>`).join("")}
       </div>
     </section>
   `;
@@ -580,8 +595,8 @@ function detalleUsuariosPickingMovil(data, total) {
           <article>
             <em>${index + 1}</em>
             <div>
-              <strong>${htmlSeguro(u.usuario)}</strong>
-              <small>${fmt(u.lpnsTotal)} LPNs | ${fmt(u.registros)} registros | ${pct(u.bultos, total).toFixed(1)}%</small>
+              <strong>${htmlSeguro(u.nombre)}</strong>
+              <small>${htmlSeguro(u.usuario)} | ${fmt(u.lpnsTotal)} LPNs | ${fmt(u.registros)} registros | ${pct(u.bultos, total).toFixed(1)}%</small>
               <span>${u.turnosDetalle.map(([turno, valor]) => `<b class="${turno.toLowerCase().replace(/\s/g, "-")}">${htmlSeguro(turno)} ${fmt(valor)}</b>`).join("")}</span>
             </div>
             <strong>${fmt(u.bultos)}</strong>
@@ -1179,6 +1194,7 @@ function actualizarVistaRf() {
   if (vistaRf === "validacion") renderValidacionPlusMovil();
   else if (vistaRf === "asignacion") renderAsignacionOperacionalMovil();
   else if (vistaRf === "trabajo") renderTrabajoAsignacionMovil();
+  else if (vistaRf === "topPicking") renderTopPickingDashboard();
   else if (vistaRf === "reportes") renderReportes();
 }
 
@@ -1214,6 +1230,7 @@ async function recargarDatos(forzar = true) {
     else if (vistaRf === "asignacion") renderAsignacionOperacionalMovil();
     else if (vistaRf === "trabajo") renderTrabajoAsignacionMovil();
     else if (vistaRf === "dashboard") renderDashboardTrabajo();
+    else if (vistaRf === "topPicking") renderTopPickingDashboard();
     else if (vistaRf === "reportes") renderReportes();
     else enfocarLpn();
     return;
@@ -1224,12 +1241,13 @@ async function recargarDatos(forzar = true) {
     boton.textContent = "Leyendo...";
   }
   try {
-    await cargarDatos({ esperarReportes: forzar });
+    await cargarDatos();
     cacheValidacionPlus = null;
     if (vistaRf === "validacion") renderValidacionPlusMovil();
     else if (vistaRf === "asignacion") renderAsignacionOperacionalMovil();
     else if (vistaRf === "trabajo") renderTrabajoAsignacionMovil();
     else if (vistaRf === "dashboard") renderDashboardTrabajo();
+    else if (vistaRf === "topPicking") renderTopPickingDashboard();
     else if (vistaRf === "reportes") renderReportes();
     else enfocarLpn();
   } catch (error) {
@@ -1781,6 +1799,86 @@ function obtenerPedidoNoAsignadoRf() {
 
 function bultosPedidoTotalAsignacionRf(row) {
   return num(campoPedido(row, ["BULTOS_PEDIDO", "BULTOS PEDIDO", "PEDIDO", "BULTOS"]));
+}
+
+function fechaPedidoKpiAsignacionRf(row) {
+  const valor = campoPedido(row, [
+    "FECHA_ORDEN",
+    "FECHA ORDEN",
+    "Fecha Orden",
+    "FECHA",
+    "Fecha",
+    "FECHA PEDIDO",
+    "Fecha Pedido",
+    "FECHA_PEDIDO"
+  ]);
+  const texto = limpiar(valor);
+  const partes = texto.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+  if (partes) {
+    const dia = Number(partes[1]);
+    const mes = Number(partes[2]) - 1;
+    const anio = Number(partes[3]) < 100 ? 2000 + Number(partes[3]) : Number(partes[3]);
+    return new Date(anio, mes, dia);
+  }
+  return fechaValor(valor);
+}
+
+function fechaPedidoKpiKey(fecha) {
+  if (!fecha) return "";
+  return String(new Date(fecha.getFullYear(), fecha.getMonth(), fecha.getDate()).getTime());
+}
+
+function fechaPedidoKpiTexto(fecha) {
+  if (!fecha) return "";
+  return fecha.toLocaleDateString("es-PE", { day: "2-digit", month: "2-digit", year: "numeric" });
+}
+
+function fechasPedidoKpiAsignacion() {
+  const mapa = new Map();
+  (dataPedido || []).forEach(row => {
+    const fecha = fechaPedidoKpiAsignacionRf(row);
+    const key = fechaPedidoKpiKey(fecha);
+    if (key && !mapa.has(key)) mapa.set(key, { key, fecha, label: fechaPedidoKpiTexto(fecha) });
+  });
+  return Array.from(mapa.values()).sort((a, b) => Number(b.key) - Number(a.key));
+}
+
+function fechaPedidoKpiActiva() {
+  const fechas = fechasPedidoKpiAsignacion();
+  if (!fechas.length) return "";
+  if (!fechaPedidoKpiAsignacion || !fechas.some(item => item.key === fechaPedidoKpiAsignacion)) {
+    fechaPedidoKpiAsignacion = fechas[0].key;
+  }
+  return fechaPedidoKpiAsignacion;
+}
+
+function pedidoKpiAsignacionPorFecha(totalOriginal) {
+  const fechaActiva = fechaPedidoKpiActiva();
+  if (!fechaActiva) return { pedido: totalOriginal, fecha: "" };
+  const fecha = fechasPedidoKpiAsignacion().find(item => item.key === fechaActiva);
+  const pedido = (dataPedido || []).reduce((acc, row) => {
+    const fechaRow = fechaPedidoKpiKey(fechaPedidoKpiAsignacionRf(row));
+    return fechaRow === fechaActiva ? acc + bultosPedidoTotalAsignacionRf(row) : acc;
+  }, 0);
+  return { pedido, fecha: fecha?.label || "" };
+}
+
+function filtroFechaPedidoKpiAsignacion() {
+  const fechas = fechasPedidoKpiAsignacion();
+  if (!fechas.length) return "";
+  const activa = fechaPedidoKpiActiva();
+  return `
+    <label class="rf-mobile-filter">Fecha pedido
+      <select onchange="cambiarFechaPedidoKpiAsignacion(this.value)">
+        ${fechas.map(item => `<option value="${item.key}" ${item.key === activa ? "selected" : ""}>${htmlSeguro(item.label)}</option>`).join("")}
+      </select>
+    </label>
+  `;
+}
+
+function cambiarFechaPedidoKpiAsignacion(valor) {
+  fechaPedidoKpiAsignacion = limpiar(valor);
+  renderAsignacionOperacionalMovil();
 }
 
 function bultosAsignadosPedidoRf(row) {
@@ -2536,6 +2634,7 @@ function renderAsignacionOperacionalMovil() {
     return;
   }
   if (!datosOperativosListos) {
+    cargarDatosOperativos();
     mostrarMensaje("Data operativa cargando", "LPNS ya esta lista. Espera a que termine la data de asignacion.");
     return;
   }
@@ -2543,6 +2642,7 @@ function renderAsignacionOperacionalMovil() {
   const reserva = data.reserva;
   const otras = data.otras;
   const resumen = data.resumen;
+  const pedidoKpi = pedidoKpiAsignacionPorFecha(resumen.pedido);
   const ubicacionesReserva = new Set(reserva.map(row => row.ubicacion).filter(Boolean)).size;
   const ubicacionesOtras = new Set(otras.map(row => row.ubicacion).filter(Boolean)).size;
   const totalReserva = reserva.reduce((acc, row) => acc + row.asignar, 0);
@@ -2554,8 +2654,9 @@ function renderAsignacionOperacionalMovil() {
           <span>Modulo RF</span>
           <h2>Asignacion Operacional</h2>
         </div>
+        ${filtroFechaPedidoKpiAsignacion()}
         <div class="rf-mobile-kpis">
-          ${kpiMovil("total", "Pedido total", fmt(resumen.pedido), "Bultos del pedido")}
+          ${kpiMovil("total", "Pedido total", fmt(pedidoKpi.pedido), pedidoKpi.fecha ? `Bultos del pedido | ${pedidoKpi.fecha}` : "Bultos del pedido")}
           ${kpiMovil("grafico", "No asignado", fmt(resumen.noAsignado), "Pendiente operacional")}
           ${kpiMovil("cumplimiento", "Sin stock", fmt(resumen.sinCobertura), `${fmt(data.sinStock.length)} productos`)}
           ${kpiMovil("pallet", "Ubic. reserva", fmt(ubicacionesReserva), `${fmt(totalReserva)} bultos MASS`)}
@@ -2587,6 +2688,7 @@ function renderTrabajoAsignacionMovil() {
     return;
   }
   if (!datosOperativosListos) {
+    cargarDatosOperativos();
     mostrarMensaje("Data operativa cargando", "LPNS ya esta lista. Espera a que termine la data de asignacion.");
     return;
   }
@@ -2697,7 +2799,7 @@ function renderReportePicking() {
   const horaPico = horas.slice().sort((a, b) => b.valor - a.valor)[0];
   const promedioHora = horas.length ? total / horas.length : 0;
   return `
-    <section class="rf-report-sheet picking rf-mobile-picking">
+    <section class="rf-report-sheet picking rf-mobile-picking rf-mobile-report" style="width:600px;max-width:100%;margin-inline:auto;">
       <div class="rf-mobile-title">
         <span>Modulo RF</span>
         <h2>Reporte de Picking</h2>
@@ -2715,6 +2817,97 @@ function renderReportePicking() {
       ${tendenciaPickingMovil(horas, total)}
       ${detalleUsuariosPickingMovil(data, total)}
     </section>
+  `;
+}
+
+function renderTopPickingDashboard() {
+  if (!datosListos) {
+    mostrarMensaje("Data cargando", "Espera unos segundos y vuelve a abrir Top Picking.");
+    return;
+  }
+  if (!reportesCargados) {
+    document.getElementById("resultado").innerHTML = `
+      <article class="result-card reports-module">
+        <div class="result-head"><span>Modulo RF</span><strong>Cargando Top Picking...</strong></div>
+        <div class="empty-state"><strong>Preparando informacion</strong><span>Se esta cargando PICKING y USUARIO desde la data BI.</span></div>
+      </article>
+    `;
+    cargarReportes().then(() => {
+      if (vistaRf === "topPicking") renderTopPickingDashboard();
+    });
+    return;
+  }
+  const data = modeloPickingReporte();
+  const total = data.reduce((acc, row) => acc + row.bultos, 0);
+  const usuarios = usuariosPickingReporte(data);
+  const top = usuarios.slice(0, 3);
+  const restantes = usuarios.slice(3);
+  const max = Math.max(...top.map(row => row.bultos), 1);
+  const horas = horasPickingReporte(data);
+  const horaPico = horas.slice().sort((a, b) => b.valor - a.valor)[0];
+  document.getElementById("resultado").innerHTML = `
+    <article class="result-card top-picking-module">
+      <section class="top-picking-hero">
+        <div>
+          <span>Ranking RF</span>
+          <h2>Top 3 Picking</h2>
+        </div>
+        <strong>${fmt(total)}<small>bultos</small></strong>
+      </section>
+      <section class="top-picking-kpis">
+        ${kpiMovil("proveedor", "Usuarios", fmt(usuarios.length), "Con picking registrado")}
+        ${kpiMovil("hora", "Hora pico", htmlSeguro(horaPico?.label || "-"), `${fmt(horaPico?.valor || 0)} bultos`)}
+        ${kpiMovil("promedio", "Promedio x hora", fmt(horas.length ? total / horas.length : 0), `${fmt(horas.length)} horas activas`)}
+      </section>
+      <section class="top-picking-podium">
+        ${top.map((usuario, index) => `
+          <article class="rank-${index + 1}">
+            <em>${index + 1}</em>
+            <div class="top-avatar">${htmlSeguro((usuario.nombre || usuario.usuario || "U").slice(0, 1).toUpperCase())}</div>
+            <div>
+              <strong>${htmlSeguro(usuario.nombre)}</strong>
+              <span>${htmlSeguro(usuario.usuario)}</span>
+            </div>
+            <b>${fmt(usuario.bultos)}<small>bultos</small></b>
+            <i><u style="width:${pct(usuario.bultos, max)}%"></u></i>
+          </article>
+        `).join("") || `<div class="empty-mini">Sin usuarios para mostrar.</div>`}
+      </section>
+      <details class="rf-mobile-card top-picking-more" open>
+        <summary>
+          <span>Demas usuarios</span>
+          <strong>${fmt(restantes.length)}</strong>
+        </summary>
+        <div class="top-picking-more-list">
+          ${restantes.map((usuario, index) => `
+            <article>
+              <em>${index + 4}</em>
+              <div>
+                <strong>${htmlSeguro(usuario.nombre)}</strong>
+                <span>${htmlSeguro(usuario.usuario)} | ${fmt(usuario.lpnsTotal)} LPNs</span>
+              </div>
+              <b>${fmt(usuario.bultos)}</b>
+              <i><u style="width:${pct(usuario.bultos, max)}%"></u></i>
+            </article>
+          `).join("") || `<div class="empty-mini">Sin mas usuarios.</div>`}
+        </div>
+      </details>
+      <section class="rf-mobile-card">
+        <div class="rf-mobile-section-title">
+          <h3>Bultos por hora</h3>
+          <strong>${fmt(total)}</strong>
+        </div>
+        <div class="rf-hour-bars">
+          ${horas.map(item => `
+            <article class="${item === horaPico ? "peak" : ""}">
+              <span>${htmlSeguro(item.label)}</span>
+              <div><i style="width:${Math.max(4, pct(item.valor, horaPico?.valor || 1))}%"></i></div>
+              <strong>${fmt(item.valor)}</strong>
+            </article>
+          `).join("")}
+        </div>
+      </section>
+    </article>
   `;
 }
 
@@ -2926,12 +3119,16 @@ function verDetalleValidacionRf(index) {
 function cambiarVistaRf(vista) {
   vistaRf = vista;
   if (vista !== "trabajo") detenerSincronizacionTrabajo();
-  document.getElementById("appView")?.classList.toggle("report-mode", vista === "reportes");
+  document.getElementById("appView")?.classList.toggle("report-mode", vista === "reportes" || vista === "topPicking");
+  document.getElementById("menuAsignacion")?.removeAttribute("open");
+  const vistaAsignacionGrupo = ["asignacion", "validacion", "trabajo", "dashboard"].includes(vista);
   document.getElementById("tabConsulta").classList.toggle("active", vista === "consulta");
   document.getElementById("tabValidacion").classList.toggle("active", vista === "validacion");
   document.getElementById("tabAsignacion").classList.toggle("active", vista === "asignacion");
   document.getElementById("tabTrabajo").classList.toggle("active", vista === "trabajo");
   document.getElementById("tabDashboard").classList.toggle("active", vista === "dashboard");
+  document.getElementById("menuAsignacion").classList.toggle("active", vistaAsignacionGrupo);
+  document.getElementById("tabTopPicking").classList.toggle("active", vista === "topPicking");
   document.getElementById("tabReportes").classList.toggle("active", vista === "reportes");
   document.querySelector(".scan-panel").hidden = vista !== "consulta";
   if (vista === "validacion") {
@@ -2946,6 +3143,9 @@ function cambiarVistaRf(vista) {
   } else if (vista === "dashboard") {
     detenerCamara();
     renderDashboardTrabajo();
+  } else if (vista === "topPicking") {
+    detenerCamara();
+    renderTopPickingDashboard();
   } else if (vista === "reportes") {
     detenerCamara();
     renderReportes();
@@ -3287,6 +3487,7 @@ document.getElementById("tabValidacion").addEventListener("click", () => cambiar
 document.getElementById("tabAsignacion").addEventListener("click", () => cambiarVistaRf("asignacion"));
 document.getElementById("tabTrabajo").addEventListener("click", () => cambiarVistaRf("trabajo"));
 document.getElementById("tabDashboard").addEventListener("click", () => cambiarVistaRf("dashboard"));
+document.getElementById("tabTopPicking").addEventListener("click", () => cambiarVistaRf("topPicking"));
 document.getElementById("tabReportes").addEventListener("click", () => cambiarVistaRf("reportes"));
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) detenerCamara();

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>ANC RF | Consulta LPN</title>
-  <link rel="stylesheet" href="css/app.css?v=20260920-dashboard-bultos">
+  <link rel="stylesheet" href="css/app.css?v=20260920-menu-top-usuarios">
 </head>
 <body>
   <section id="loginView" class="login-screen">
@@ -43,10 +43,16 @@
     <main class="rf-main">
       <nav class="rf-tabs" aria-label="Modulo RF">
         <button type="button" id="tabConsulta" class="active">Consulta LPN</button>
-        <button type="button" id="tabValidacion">Validacion Plus</button>
-        <button type="button" id="tabAsignacion">Asignacion</button>
-        <button type="button" id="tabTrabajo">Trabajo</button>
-        <button type="button" id="tabDashboard">Dashboard</button>
+        <details class="rf-tab-menu" id="menuAsignacion">
+          <summary id="tabAsignacionGrupo">Asignacion</summary>
+          <div>
+            <button type="button" id="tabAsignacion">Asignacion</button>
+            <button type="button" id="tabValidacion">Validacion</button>
+            <button type="button" id="tabTrabajo">Trabajo</button>
+            <button type="button" id="tabDashboard">Dashboard</button>
+          </div>
+        </details>
+        <button type="button" id="tabTopPicking">Top Picking</button>
         <button type="button" id="tabReportes">Reportes</button>
       </nav>
       <section class="scan-panel">
@@ -83,7 +89,7 @@
     </main>
   </section>
 
-  <script src="js/data.js?v=20260920-dashboard-exacto"></script>
-  <script src="js/app.js?v=20260920-dashboard-exacto"></script>
+  <script src="js/data.js?v=20260920-flujo-original"></script>
+  <script src="js/app.js?v=20260920-top-sin-texto"></script>
 </body>
 </html>
