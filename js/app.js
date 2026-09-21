@@ -1,7 +1,7 @@
 const RF_USER = "SCANER";
 const RF_PASS = "1234";
 const CAPACIDAD_DINAMICA_UND = 999999;
-const TRABAJO_API_URL = "https://script.google.com/macros/s/AKfycbx3KCscftCBQkO0TUi6Po9bLvRHdL1d7_RL9Ua7__C3LmISFlqs-YRjl-qFNwGtf3UA/exec";
+const TRABAJO_API_URL = "https://script.google.com/macros/s/AKfycbyWQhNnijyYZY3rT5q-5tKdRe3FrgcgpxXvWzPDHCrzzY_d-RQJ4A4GdaB89XHORuvK/exec";
 const TRABAJO_API_STORAGE_KEY = "rf_trabajo_api_url";
 const TRABAJO_POLL_MS = 5000;
 
@@ -27,7 +27,9 @@ let sincronizandoTrabajo = false;
 let guardandoTrabajo = new Set();
 let operadorTrabajo = localStorage.getItem("rf_trabajo_operador") || "";
 let estadoTrabajoRemoto = {};
+let firmaEstadoTrabajoRemoto = "";
 let tareasTrabajoRegistradas = false;
+let registrandoTareasTrabajo = false;
 let cacheUsuariosReportePorDni = { firma: "", mapa: new Map() };
 let fechaPedidoKpiAsignacion = "";
 
@@ -76,6 +78,13 @@ function apiTrabajoDisponible() {
   return /^https:\/\/script\.google\.com\/macros\/s\/.+\/exec(?:\?.*)?$/i.test(urlApiTrabajo());
 }
 
+function firmaEstadoTrabajo(estados) {
+  return Object.keys(estados || {}).sort().map(key => {
+    const row = estados[key] || {};
+    return [key, row.estado, row.operador, row.actualizado].map(limpiar).join("|");
+  }).join("~");
+}
+
 async function leerAvanceTrabajoHoja() {
   const filas = await cargarHojaDesde(TRABAJO_SHEET_ID, "AVANCE_TRABAJO");
   const estados = {};
@@ -102,33 +111,37 @@ async function leerEstadoTrabajoRemoto() {
   try {
     let remotos = {};
     try {
-      // La hoja conserva los decimales exactos; se prioriza sobre la respuesta antigua de la API.
-      remotos = await leerAvanceTrabajoHoja();
-    } catch (hojaError) {
-      console.warn("No se pudo leer AVANCE_TRABAJO directamente:", hojaError.message || hojaError);
+      const url = new URL(urlApiTrabajo());
+      url.searchParams.set("action", "ESTADO");
+      url.searchParams.set("_", Date.now());
+      const response = await fetch(url, { cache: "no-store" });
+      const data = await response.json();
+      if (!response.ok || data.ok === false) throw new Error(data.mensaje || "No se pudo leer el avance remoto.");
+      remotos = data.estados || {};
+    } catch (apiError) {
+      console.warn("API Trabajo no disponible:", apiError.message || apiError);
     }
     if (!Object.keys(remotos).length) {
       try {
-        const url = new URL(urlApiTrabajo());
-        url.searchParams.set("action", "ESTADO");
-        url.searchParams.set("_", Date.now());
-        const response = await fetch(url, { cache: "no-store" });
-        const data = await response.json();
-        if (!response.ok || data.ok === false) throw new Error(data.mensaje || "No se pudo leer el avance remoto.");
-        remotos = data.estados || {};
-      } catch (apiError) {
-        console.warn("API Trabajo no disponible:", apiError.message || apiError);
+        remotos = await leerAvanceTrabajoHoja();
+      } catch (hojaError) {
+        console.warn("No se pudo leer AVANCE_TRABAJO directamente:", hojaError.message || hojaError);
       }
     }
+    const nuevaFirma = firmaEstadoTrabajo(remotos);
+    const estadoCambio = nuevaFirma !== firmaEstadoTrabajoRemoto;
     estadoTrabajoRemoto = remotos;
+    firmaEstadoTrabajoRemoto = nuevaFirma;
     const tareas = datosOperativosListos ? procesarAsignacionOperacionalRf() : { reserva: [], otras: [] };
     [...tareas.reserva, ...tareas.otras].forEach(row => {
       const key = claveAsignacionOperativa(row);
       estadoAsignacionOperativa[key] = normalizar(remotos[key]?.estado) === "COMPLETO" ? "completo" : "pendiente";
     });
-    localStorage.setItem("rf_asignacion_operativa_estado", JSON.stringify(estadoAsignacionOperativa));
-    if (vistaRf === "trabajo" && datosOperativosListos) renderTrabajoAsignacionMovil();
-    else if (vistaRf === "dashboard") renderDashboardTrabajo();
+    if (estadoCambio) {
+      localStorage.setItem("rf_asignacion_operativa_estado", JSON.stringify(estadoAsignacionOperativa));
+      if (vistaRf === "trabajo" && datosOperativosListos) renderTrabajoAsignacionMovil();
+      else if (vistaRf === "dashboard") renderDashboardTrabajo();
+    }
   } catch (error) {
     console.warn("No se pudo sincronizar Trabajo:", error.message || error);
   } finally {
@@ -151,7 +164,8 @@ function detenerSincronizacionTrabajo() {
 }
 
 async function registrarTareasTrabajoRemoto() {
-  if (!apiTrabajoDisponible() || tareasTrabajoRegistradas || !datosOperativosListos) return;
+  if (!apiTrabajoDisponible() || tareasTrabajoRegistradas || registrandoTareasTrabajo || !datosOperativosListos) return;
+  registrandoTareasTrabajo = true;
   const data = procesarAsignacionOperacionalRf();
   const tareas = [...data.reserva, ...data.otras].map(row => ({
     clave: claveAsignacionOperativa(row),
@@ -173,6 +187,8 @@ async function registrarTareasTrabajoRemoto() {
     leerEstadoTrabajoRemoto();
   } catch (error) {
     console.warn("No se pudieron registrar las tareas remotas:", error.message || error);
+  } finally {
+    registrandoTareasTrabajo = false;
   }
 }
 
@@ -2442,7 +2458,9 @@ async function limpiarAvanceAsignacionOperativa() {
   }
   estadoAsignacionOperativa = {};
   estadoTrabajoRemoto = {};
+  firmaEstadoTrabajoRemoto = "";
   tareasTrabajoRegistradas = false;
+  registrandoTareasTrabajo = false;
   localStorage.removeItem("rf_asignacion_operativa_estado");
   renderTrabajoAsignacionMovil();
 }
@@ -2732,7 +2750,17 @@ function renderDashboardTrabajo() {
     return;
   }
   iniciarSincronizacionTrabajo();
-  const estados = Object.values(estadoTrabajoRemoto || {});
+  const dataTrabajoActual = datosOperativosListos ? procesarAsignacionOperacionalRf() : { reserva: [], otras: [] };
+  const tareasActuales = [...dataTrabajoActual.reserva, ...dataTrabajoActual.otras];
+  const tareasPorClave = new Map(tareasActuales.map(row => [claveAsignacionOperativa(row), row]));
+  const estados = Object.entries(estadoTrabajoRemoto || {}).map(([clave, estado]) => {
+    const tarea = tareasPorClave.get(clave);
+    return {
+      ...estado,
+      ubicacion: tarea?.ubicacion || estado.ubicacion,
+      bultos: tarea ? num(tarea.asignar) : num(estado.bultos)
+    };
+  });
   const total = estados.length;
   const completos = estados.filter(row => normalizar(row.estado) === "COMPLETO");
   const pendientes = Math.max(0, total - completos.length);

@@ -130,7 +130,7 @@ function registrarTareas_(tareas) {
       limpiar_(tarea.codigo),
       limpiar_(tarea.ubicacion),
       limpiar_(tarea.lpn),
-      Number(tarea.bultos || 0)
+      numero_(tarea.bultos)
     ]);
     existentes.add(clave);
   });
