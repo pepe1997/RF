@@ -7,7 +7,7 @@ const RF_USUARIOS = {
     inicial: "consulta"
   },
   CDOSLO: {
-    password: "Oslo.2027",
+    password: "291997",
     vistas: ["topPicking", "reportes"],
     inicial: "topPicking"
   }
