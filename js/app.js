@@ -3120,7 +3120,6 @@ function cambiarVistaRf(vista) {
   vistaRf = vista;
   if (vista !== "trabajo") detenerSincronizacionTrabajo();
   document.getElementById("appView")?.classList.toggle("report-mode", vista === "reportes" || vista === "topPicking");
-  document.getElementById("menuAsignacion")?.removeAttribute("open");
   const vistaAsignacionGrupo = ["asignacion", "validacion", "trabajo", "dashboard"].includes(vista);
   document.getElementById("tabConsulta").classList.toggle("active", vista === "consulta");
   document.getElementById("tabValidacion").classList.toggle("active", vista === "validacion");

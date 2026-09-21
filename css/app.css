@@ -176,13 +176,15 @@ button { cursor: pointer; }
 }
 
 .rf-tabs {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  display: flex;
   gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+  scrollbar-width: thin;
 }
 
 .rf-tabs button,
-.rf-tab-menu summary {
+.rf-tab-menu button {
   min-height: 46px;
   border: 2px solid var(--line);
   border-radius: 12px;
@@ -193,48 +195,16 @@ button { cursor: pointer; }
 }
 
 .rf-tabs button.active,
-.rf-tab-menu.active summary {
+.rf-tab-menu button.active {
   border-color: var(--blue);
   color: white;
   background: var(--blue);
 }
 
 .rf-tab-menu {
-  position: relative;
-  min-width: 0;
-}
-
-.rf-tab-menu summary {
-  display: grid;
-  place-items: center;
-  list-style: none;
-  cursor: pointer;
-}
-
-.rf-tab-menu summary::-webkit-details-marker {
-  display: none;
-}
-
-.rf-tab-menu div {
-  position: absolute;
-  z-index: 10;
-  top: calc(100% + 6px);
-  left: 0;
-  width: min(240px, 78vw);
-  display: grid;
+  display: flex;
   gap: 6px;
-  padding: 8px;
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  background: white;
-  box-shadow: 0 16px 36px rgba(15, 23, 42, .2);
-}
-
-.rf-tab-menu div button {
-  width: 100%;
-  min-height: 42px;
-  text-align: left;
-  padding: 0 12px;
+  flex: 0 0 auto;
 }
 
 @media (max-width: 559px) {
@@ -245,23 +215,13 @@ button { cursor: pointer; }
     padding: 8px;
   }
 
-  .rf-tabs {
-    display: flex;
-    overflow-x: auto;
-    padding-bottom: 2px;
-    scrollbar-width: thin;
-  }
-
-  .rf-tabs button {
+  .rf-tabs > button,
+  .rf-tab-menu > button {
     flex: 0 0 128px;
   }
 
   .rf-tab-menu {
-    flex: 0 0 128px;
-  }
-
-  .rf-tab-menu summary {
-    height: 46px;
+    flex: 0 0 auto;
   }
 }
 
