@@ -1,5 +1,17 @@
 const RF_USER = "SCANER";
 const RF_PASS = "1234";
+const RF_USUARIOS = {
+  SCANER: {
+    password: RF_PASS,
+    vistas: ["consulta", "asignacion", "validacion", "trabajo", "dashboard", "topPicking", "reportes"],
+    inicial: "consulta"
+  },
+  CDOSLO: {
+    password: "Oslo.2027",
+    vistas: ["topPicking", "reportes"],
+    inicial: "topPicking"
+  }
+};
 const CAPACIDAD_DINAMICA_UND = 999999;
 const TRABAJO_API_URL = "https://script.google.com/macros/s/AKfycbyWQhNnijyYZY3rT5q-5tKdRe3FrgcgpxXvWzPDHCrzzY_d-RQJ4A4GdaB89XHORuvK/exec";
 const TRABAJO_API_STORAGE_KEY = "rf_trabajo_api_url";
@@ -13,6 +25,7 @@ let productosActuales = [];
 let codigoSeleccionado = "";
 let timerSugerencias = null;
 let vistaRf = "consulta";
+let usuarioActivo = null;
 let cacheValidacionPlus = null;
 let reporteActivo = "picking";
 let turnoReportePicking = "TODOS";
@@ -32,6 +45,38 @@ let tareasTrabajoRegistradas = false;
 let registrandoTareasTrabajo = false;
 let cacheUsuariosReportePorDni = { firma: "", mapa: new Map() };
 let fechaPedidoKpiAsignacion = "";
+
+function perfilUsuarioActivo() {
+  return usuarioActivo?.perfil || RF_USUARIOS.SCANER;
+}
+
+function usuarioTieneVista(vista) {
+  return perfilUsuarioActivo().vistas.includes(vista);
+}
+
+function vistaInicialUsuario() {
+  return perfilUsuarioActivo().inicial || perfilUsuarioActivo().vistas[0] || "consulta";
+}
+
+function aplicarPermisosUsuario() {
+  const vistasBotones = {
+    consulta: "tabConsulta",
+    asignacion: "tabAsignacion",
+    validacion: "tabValidacion",
+    trabajo: "tabTrabajo",
+    dashboard: "tabDashboard",
+    topPicking: "tabTopPicking",
+    reportes: "tabReportes"
+  };
+  Object.entries(vistasBotones).forEach(([vista, id]) => {
+    const boton = document.getElementById(id);
+    if (boton) boton.hidden = !usuarioTieneVista(vista);
+  });
+  const menuAsignacion = document.getElementById("menuAsignacion");
+  if (menuAsignacion) {
+    menuAsignacion.hidden = !["asignacion", "validacion", "trabajo", "dashboard"].some(usuarioTieneVista);
+  }
+}
 
 function clavesUsuarioDniReporte(valor) {
   const texto = limpiar(valor);
@@ -1201,6 +1246,7 @@ function setProveedoresReporte(modo) {
 function mostrarApp() {
   document.getElementById("loginView").hidden = true;
   document.getElementById("appView").hidden = false;
+  aplicarPermisosUsuario();
   recargarDatos(false);
 }
 
@@ -1224,17 +1270,23 @@ function validarLogin(event) {
   event.preventDefault();
   const user = normalizar(document.getElementById("usuario").value);
   const pass = limpiar(document.getElementById("password").value);
-  if (user !== RF_USER || pass !== RF_PASS) {
+  const perfil = RF_USUARIOS[user];
+  if (!perfil || pass !== perfil.password) {
     document.getElementById("loginError").textContent = "Usuario o contrasena incorrecta.";
     document.getElementById("password").select();
     return;
   }
+  usuarioActivo = { codigo: user, perfil };
+  vistaRf = vistaInicialUsuario();
   document.getElementById("loginError").textContent = "";
   mostrarApp();
 }
 
 function salir() {
   detenerCamara();
+  usuarioActivo = null;
+  vistaRf = "consulta";
+  aplicarPermisosUsuario();
   document.getElementById("password").value = "";
   mostrarLogin();
 }
@@ -3145,6 +3197,7 @@ function verDetalleValidacionRf(index) {
 }
 
 function cambiarVistaRf(vista) {
+  if (!usuarioTieneVista(vista)) vista = vistaInicialUsuario();
   vistaRf = vista;
   if (vista !== "trabajo") detenerSincronizacionTrabajo();
   document.getElementById("appView")?.classList.toggle("report-mode", vista === "reportes" || vista === "topPicking");
