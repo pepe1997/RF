@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>ANC RF | Consulta LPN</title>
-  <link rel="stylesheet" href="css/app.css?v=20260920-menu-horizontal-mobile">
+  <link rel="stylesheet" href="css/app.css?v=20260922-cdoslo-header-refresh">
 </head>
 <body>
   <section id="loginView" class="login-screen">
@@ -35,9 +35,12 @@
     <header class="rf-header">
       <div>
         <span>Modulo RF</span>
-        <strong>Consulta por LPN</strong>
+        <strong id="tituloModuloRf">Consulta por LPN</strong>
       </div>
-      <button type="button" id="logoutButton">Salir</button>
+      <div class="rf-header-actions">
+        <button type="button" id="headerRefreshButton">Actualizar</button>
+        <button type="button" id="logoutButton">Salir</button>
+      </div>
     </header>
 
     <main class="rf-main">
@@ -87,6 +90,6 @@
   </section>
 
   <script src="js/data.js?v=20260920-flujo-original"></script>
-  <script src="js/app.js?v=20260921-usuario-cdoslo-pass"></script>
+  <script src="js/app.js?v=20260922-cdoslo-vista-inicial"></script>
 </body>
 </html>

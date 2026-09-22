@@ -151,6 +151,13 @@ button { cursor: pointer; }
   font-size: 20px;
 }
 
+.rf-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
 .rf-header button {
   min-height: 38px;
   padding: 0 12px;
@@ -207,6 +214,16 @@ button { cursor: pointer; }
   flex: 0 0 auto;
 }
 
+.limited-nav .rf-tabs {
+  justify-content: center;
+  overflow-x: visible;
+}
+
+.limited-nav .rf-tabs > button {
+  flex: 0 1 180px;
+  min-width: 150px;
+}
+
 @media (max-width: 559px) {
   .rf-main,
   .report-mode .rf-main {
@@ -222,6 +239,15 @@ button { cursor: pointer; }
 
   .rf-tab-menu {
     flex: 0 0 auto;
+  }
+
+  .limited-nav .rf-tabs {
+    justify-content: center;
+  }
+
+  .limited-nav .rf-tabs > button {
+    flex: 1 1 0;
+    min-width: 0;
   }
 }
 

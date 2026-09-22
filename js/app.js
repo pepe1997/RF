@@ -29,7 +29,6 @@ let usuarioActivo = null;
 let cacheValidacionPlus = null;
 let reporteActivo = "picking";
 let turnoReportePicking = "TODOS";
-let turnoReporteRecepcion = "TODOS";
 let turnoReporteDespacho = "TODOS";
 let proveedoresReporteSeleccionados = null;
 let estadoAsignacionOperativa = JSON.parse(localStorage.getItem("rf_asignacion_operativa_estado") || "{}");
@@ -76,6 +75,21 @@ function aplicarPermisosUsuario() {
   if (menuAsignacion) {
     menuAsignacion.hidden = !["asignacion", "validacion", "trabajo", "dashboard"].some(usuarioTieneVista);
   }
+  document.getElementById("appView")?.classList.toggle("limited-nav", perfilUsuarioActivo().vistas.length <= 2);
+}
+
+function actualizarTituloModuloRf() {
+  const titulos = {
+    consulta: "Consulta por LPN",
+    asignacion: "Asignacion Operacional",
+    validacion: "Validacion Plus",
+    trabajo: "Trabajo No Asignado",
+    dashboard: "Dashboard de avance",
+    topPicking: "Top Picking",
+    reportes: "Reportes"
+  };
+  const titulo = document.getElementById("tituloModuloRf");
+  if (titulo) titulo.textContent = titulos[vistaRf] || "Modulo RF";
 }
 
 function clavesUsuarioDniReporte(valor) {
@@ -335,6 +349,10 @@ function horaFecha(fecha) {
 function horaValor(valor) {
   const texto = limpiar(valor);
   if (!texto) return null;
+  const numeroHora = num(texto);
+  if (/^[\d.,]+$/.test(texto) && numeroHora > 0 && numeroHora < 1) {
+    return Math.floor(numeroHora * 24);
+  }
   const fecha = fechaValor(texto);
   if (fecha) return horaFecha(fecha);
   const limpio = texto
@@ -405,8 +423,7 @@ function modeloRecepcionReporte() {
     const nombreBase = limpiar(campo(r, ["NOM PROVEEDOR", "NOMBRE PROVEEDOR", "Proveedor"]));
     const proveedor = nombreBase || (codigoProveedor === "917" ? "PUNTA NEGRA" : "SIN PROVEEDOR");
     const fecha = fechaValor(campo(r, ["Fe Recepcion", "FE RECEPCION", "FECHA RECEPCION", "FECHA"]));
-    const horaRaw = campo(r, ["HORA RECEPCION", "HORA", "Hora"]);
-    const hora = horaRaw !== "" ? Math.trunc(num(horaRaw)) : horaFecha(fecha);
+    const hora = horaFecha(fecha);
     return {
       index,
       codigoProveedor,
@@ -1216,11 +1233,6 @@ function cambiarTurnoReporte(turno) {
   renderReportes();
 }
 
-function cambiarTurnoRecepcionRf(turno) {
-  turnoReporteRecepcion = turno;
-  renderReportes();
-}
-
 function cambiarTurnoDespachoRf(turno) {
   turnoReporteDespacho = turno;
   renderReportes();
@@ -1247,6 +1259,8 @@ function mostrarApp() {
   document.getElementById("loginView").hidden = true;
   document.getElementById("appView").hidden = false;
   aplicarPermisosUsuario();
+  actualizarTituloModuloRf();
+  cambiarVistaRf(vistaRf);
   recargarDatos(false);
 }
 
@@ -1303,11 +1317,11 @@ async function recargarDatos(forzar = true) {
     else enfocarLpn();
     return;
   }
-  const boton = document.getElementById("refreshButton");
-  if (boton) {
+  const botones = [document.getElementById("refreshButton"), document.getElementById("headerRefreshButton")].filter(Boolean);
+  botones.forEach(boton => {
     boton.disabled = true;
     boton.textContent = "Leyendo...";
-  }
+  });
   try {
     await cargarDatos();
     cacheValidacionPlus = null;
@@ -1322,10 +1336,10 @@ async function recargarDatos(forzar = true) {
     estado("Error al cargar data");
     mostrarMensaje("No se pudo cargar LPNS", error.message || String(error), true);
   } finally {
-    if (boton) {
+    botones.forEach(boton => {
       boton.disabled = false;
-      boton.textContent = "Actualizar data";
-    }
+      boton.textContent = boton.id === "headerRefreshButton" ? "Actualizar" : "Actualizar data";
+    });
   }
 }
 
@@ -3018,11 +3032,10 @@ function filtroProveedoresReporte(proveedores) {
 
 function renderReporteRecepcion() {
   const dataGeneral = modeloRecepcionReporte();
-  const dataTurno = turnoReporteRecepcion === "TODOS" ? dataGeneral : dataGeneral.filter(r => r.turno === turnoReporteRecepcion);
-  const proveedores = proveedoresResumenReporte(dataTurno);
+  const proveedores = proveedoresResumenReporte(dataGeneral);
   const visibles = proveedoresVisiblesReporte(proveedores);
   const claves = new Set(visibles.map(p => p.key));
-  const dataVisible = dataTurno.filter(row => claves.has(row.proveedorKey));
+  const dataVisible = dataGeneral.filter(row => claves.has(row.proveedorKey));
   const resumen = resumenRecepcionRf(dataVisible, visibles);
   return `
     <section class="rf-report-sheet reception rf-mobile-picking rf-mobile-report">
@@ -3030,11 +3043,6 @@ function renderReporteRecepcion() {
         <span>Modulo RF</span>
         <h2>Reporte de Recepcion</h2>
       </div>
-      <label class="rf-mobile-filter">Turno
-        <select onchange="cambiarTurnoRecepcionRf(this.value)">
-          ${["TODOS", "DIA", "TARDE", "NOCHE"].map(t => `<option value="${t}" ${turnoReporteRecepcion === t ? "selected" : ""}>${t}</option>`).join("")}
-        </select>
-      </label>
       <div class="rf-mobile-kpis">
         ${kpiMovil("recibido", "Recibido", fmt(resumen.totalRecibido), "Bultos recibidos")}
         ${kpiMovil("total", "Programado", fmt(resumen.totalProgramado), "Bultos programados")}
@@ -3199,6 +3207,7 @@ function verDetalleValidacionRf(index) {
 function cambiarVistaRf(vista) {
   if (!usuarioTieneVista(vista)) vista = vistaInicialUsuario();
   vistaRf = vista;
+  actualizarTituloModuloRf();
   if (vista !== "trabajo") detenerSincronizacionTrabajo();
   document.getElementById("appView")?.classList.toggle("report-mode", vista === "reportes" || vista === "topPicking");
   const vistaAsignacionGrupo = ["asignacion", "validacion", "trabajo", "dashboard"].includes(vista);
@@ -3559,6 +3568,7 @@ document.getElementById("lpnInput").addEventListener("blur", () => setTimeout(oc
 document.getElementById("sugerenciasBusqueda").addEventListener("pointerdown", manejarClickSugerencia);
 document.getElementById("sugerenciasBusqueda").addEventListener("click", manejarClickSugerencia);
 document.getElementById("refreshButton").addEventListener("click", () => recargarDatos(true));
+document.getElementById("headerRefreshButton").addEventListener("click", () => recargarDatos(true));
 document.getElementById("logoutButton").addEventListener("click", salir);
 document.getElementById("cameraButton").addEventListener("click", alternarCamara);
 document.getElementById("resultado").addEventListener("click", manejarClickResultado);
